@@ -55,6 +55,9 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+const ACTIVE_SYSTEMD_ALERT_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+const SYSTEMD_ALERT_DEDUPE_CONSTRAINT = "issues_active_systemd_alert_incident_uq";
+const SYSTEMD_ALERT_AUTO_CLOSE_WINDOW_MS = 24 * 60 * 60 * 1000;
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -84,6 +87,20 @@ function readStringFromRecord(record: unknown, key: string) {
   if (!record || typeof record !== "object") return null;
   const value = (record as Record<string, unknown>)[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function readDateFromRecord(record: unknown, key: string) {
+  const value = readStringFromRecord(record, key);
+  if (!value) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isSystemdAlertDedupeConflict(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const err = error as { code?: string; constraint?: string; constraint_name?: string };
+  const constraint = err.constraint ?? err.constraint_name;
+  return err.code === "23505" && constraint === SYSTEMD_ALERT_DEDUPE_CONSTRAINT;
 }
 
 export interface IssueFilters {
@@ -2594,25 +2611,6 @@ export function issueService(db: Db) {
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);
         }
-        // Self-correcting counter: use MAX(issue_number) + 1 if the counter
-        // has drifted below the actual max, preventing identifier collisions.
-        const [maxRow] = await tx
-          .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
-          .from(issues)
-          .where(eq(issues.companyId, companyId));
-        const currentMax = maxRow?.maxNum ?? 0;
-
-        const [company] = await tx
-          .update(companies)
-          .set({
-            issueCounter: sql`greatest(${companies.issueCounter}, ${currentMax}) + 1`,
-          })
-          .where(eq(companies.id, companyId))
-          .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
-
-        const issueNumber = company.issueCounter;
-        const identifier = `${company.issuePrefix}-${issueNumber}`;
-
         const values = {
           ...issueData,
           originKind: issueData.originKind ?? "manual",
@@ -2627,8 +2625,6 @@ export function issueService(db: Db) {
           ...(executionWorkspacePreference ? { executionWorkspacePreference } : {}),
           ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
           companyId,
-          issueNumber,
-          identifier,
         } as typeof issues.$inferInsert;
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
@@ -2640,58 +2636,96 @@ export function issueService(db: Db) {
           values.cancelledAt = new Date();
         }
 
+        const findExistingSystemdAlertIssue = async (dbOrTx: any) => dbOrTx
+          .select()
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, companyId),
+              eq(issues.originKind, "systemd_alert"),
+              eq(issues.originFingerprint, values.originFingerprint!),
+              isNull(issues.hiddenAt),
+              inArray(issues.status, [...ACTIVE_SYSTEMD_ALERT_STATUSES]),
+            ),
+          )
+          .then((rows: IssueRow[]) => rows[0] ?? null);
+
+        const addSystemdAlertRecurrenceComment = async (dbOrTx: any, issueId: string) => {
+          const commentBody = `⚠️ **Alert recurred at ${new Date().toISOString()}**\n\n${values.description || "No additional details provided."}`;
+          await dbOrTx.insert(issueComments).values({
+            companyId,
+            issueId,
+            authorAgentId: values.createdByAgentId ?? null,
+            authorUserId: values.createdByUserId ?? null,
+            body: commentBody,
+          });
+        };
+
+        const insertIssue = async (dbOrTx: any) => {
+          // Self-correcting counter: use MAX(issue_number) + 1 if the counter
+          // has drifted below the actual max, preventing identifier collisions.
+          const [maxRow] = await dbOrTx
+            .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
+            .from(issues)
+            .where(eq(issues.companyId, companyId));
+          const currentMax = maxRow?.maxNum ?? 0;
+
+          const [company] = await dbOrTx
+            .update(companies)
+            .set({
+              issueCounter: sql`greatest(${companies.issueCounter}, ${currentMax}) + 1`,
+            })
+            .where(eq(companies.id, companyId))
+            .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
+
+          const [issue] = await dbOrTx.insert(issues).values({
+            ...values,
+            issueNumber: company.issueCounter,
+            identifier: `${company.issuePrefix}-${company.issueCounter}`,
+          }).returning();
+          if (inputLabelIds) {
+            await syncIssueLabels(issue.id, companyId, inputLabelIds, dbOrTx);
+          }
+          if (blockedByIssueIds !== undefined) {
+            await syncBlockedByIssueIds(
+              issue.id,
+              companyId,
+              blockedByIssueIds,
+              {
+                agentId: issueData.createdByAgentId ?? null,
+                userId: issueData.createdByUserId ?? null,
+              },
+              dbOrTx,
+            );
+          }
+          const [enriched] = await withIssueLabels(dbOrTx, [issue]);
+          return enriched;
+        };
+
         // Anti-dupe alerting: systemd_alert deduplication
         // Один открытый тикет per unit+service fingerprint
         if (values.originKind === "systemd_alert" && values.originFingerprint) {
-          const existing = await tx
-            .select()
-            .from(issues)
-            .where(
-              and(
-                eq(issues.companyId, companyId),
-                eq(issues.originKind, "systemd_alert"),
-                eq(issues.originFingerprint, values.originFingerprint),
-                isNull(issues.hiddenAt),
-                inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
-              ),
-            )
-            .then((rows) => rows[0] ?? null);
+          const existing = await findExistingSystemdAlertIssue(tx);
 
           if (existing) {
-            // Add comment to existing issue about recurrence
-            const commentBody = `⚠️ **Alert recurred at ${new Date().toISOString()}**\n\n${values.description || "No additional details provided."}`;
-            await tx.insert(issueComments).values({
-              companyId,
-              issueId: existing.id,
-              authorAgentId: values.createdByAgentId ?? null,
-              authorUserId: values.createdByUserId ?? null,
-              body: commentBody,
-            });
-
-            // Return existing issue instead of creating duplicate
+            await addSystemdAlertRecurrenceComment(tx, existing.id);
             const [enriched] = await withIssueLabels(tx, [existing]);
+            return enriched;
+          }
+
+          try {
+            return await tx.transaction(async (insertTx) => insertIssue(insertTx));
+          } catch (error) {
+            if (!isSystemdAlertDedupeConflict(error)) throw error;
+            const existingAfterConflict = await findExistingSystemdAlertIssue(tx);
+            if (!existingAfterConflict) throw error;
+            await addSystemdAlertRecurrenceComment(tx, existingAfterConflict.id);
+            const [enriched] = await withIssueLabels(tx, [existingAfterConflict]);
             return enriched;
           }
         }
 
-        const [issue] = await tx.insert(issues).values(values).returning();
-        if (inputLabelIds) {
-          await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
-        }
-        if (blockedByIssueIds !== undefined) {
-          await syncBlockedByIssueIds(
-            issue.id,
-            companyId,
-            blockedByIssueIds,
-            {
-              agentId: issueData.createdByAgentId ?? null,
-              userId: issueData.createdByUserId ?? null,
-            },
-            tx,
-          );
-        }
-        const [enriched] = await withIssueLabels(tx, [issue]);
-        return enriched;
+        return insertIssue(tx);
       });
     },
 
@@ -2734,6 +2768,21 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+      let autoCloseSystemdAlert = false;
+
+      if (
+        existing.originKind === "systemd_alert" &&
+        issueData.executionState !== undefined &&
+        issueData.status === undefined &&
+        ACTIVE_SYSTEMD_ALERT_STATUSES.includes(existing.status as (typeof ACTIVE_SYSTEMD_ALERT_STATUSES)[number])
+      ) {
+        const lastGreenAt = readDateFromRecord(issueData.executionState, "lastGreenAt");
+        if (lastGreenAt && (Date.now() - lastGreenAt.getTime()) >= SYSTEMD_ALERT_AUTO_CLOSE_WINDOW_MS) {
+          patch.status = "done";
+          autoCloseSystemdAlert = true;
+          assertTransition(existing.status, patch.status);
+        }
+      }
 
       const nextAssigneeAgentId =
         issueData.assigneeAgentId !== undefined ? issueData.assigneeAgentId : existing.assigneeAgentId;
@@ -2839,6 +2888,16 @@ export function issueService(db: Db) {
             },
             tx,
           );
+        }
+        if (autoCloseSystemdAlert) {
+          const lastGreenAt = readStringFromRecord(updated.executionState, "lastGreenAt");
+          await tx.insert(issueComments).values({
+            companyId: existing.companyId,
+            issueId: updated.id,
+            authorAgentId: actorAgentId ?? null,
+            authorUserId: actorUserId ?? null,
+            body: `Resolved automatically after 24h green state since ${lastGreenAt ?? "an unknown timestamp"}.`,
+          });
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;

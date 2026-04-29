@@ -2068,6 +2068,119 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService systemd alert dedupe", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-systemd-alerts-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("reuses the open issue and adds a recurrence comment for duplicate systemd alerts", async () => {
+    const companyId = randomUUID();
+    const fingerprint = "systemd:balance1-etl.service:failed";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const first = await svc.create(companyId, {
+      title: "balance1-etl.service failed",
+      description: "First failure sample",
+      originKind: "systemd_alert",
+      originFingerprint: fingerprint,
+      status: "todo",
+      priority: "high",
+    });
+
+    const second = await svc.create(companyId, {
+      title: "balance1-etl.service failed again",
+      description: "Second failure sample",
+      originKind: "systemd_alert",
+      originFingerprint: fingerprint,
+      status: "todo",
+      priority: "high",
+    });
+
+    const matchingIssues = await db.select().from(issues).where(eq(issues.companyId, companyId));
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, first.id));
+
+    expect(second.id).toBe(first.id);
+    expect(matchingIssues.filter((issue) => issue.originFingerprint === fingerprint)).toHaveLength(1);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Alert recurred");
+    expect(comments[0]?.body).toContain("Second failure sample");
+  });
+
+  it("auto-closes green systemd alerts after 24 hours and allows a fresh incident afterwards", async () => {
+    const companyId = randomUUID();
+    const fingerprint = "systemd:balance1-etl.service:failed";
+    const staleGreenAt = new Date(Date.now() - (25 * 60 * 60 * 1000)).toISOString();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const incident = await svc.create(companyId, {
+      title: "balance1-etl.service failed",
+      description: "Initial failure",
+      originKind: "systemd_alert",
+      originFingerprint: fingerprint,
+      status: "todo",
+      priority: "high",
+    });
+
+    const resolved = await svc.update(incident.id, {
+      executionState: { lastGreenAt: staleGreenAt },
+    });
+
+    const resolutionComments = await db.select().from(issueComments).where(eq(issueComments.issueId, incident.id));
+    const reopened = await svc.create(companyId, {
+      title: "balance1-etl.service failed after recovery",
+      description: "Fresh failure after green window",
+      originKind: "systemd_alert",
+      originFingerprint: fingerprint,
+      status: "todo",
+      priority: "high",
+    });
+
+    expect(resolved.status).toBe("done");
+    expect(resolutionComments).toHaveLength(1);
+    expect(resolutionComments[0]?.body).toContain("Resolved automatically after 24h green state");
+    expect(resolutionComments[0]?.body).toContain(staleGreenAt);
+    expect(reopened.id).not.toBe(incident.id);
+    expect(reopened.status).toBe("todo");
+  });
+});
+
 describeEmbeddedPostgres("issueService.findMentionedProjectIds", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;

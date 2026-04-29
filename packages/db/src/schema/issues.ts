@@ -123,5 +123,12 @@ export const issues = pgTable(
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
       ),
+    activeSystemdAlertIncidentIdx: uniqueIndex("issues_active_systemd_alert_incident_uq")
+      .on(table.companyId, table.originFingerprint)
+      .where(
+        sql`${table.originKind} = 'systemd_alert'
+          and ${table.hiddenAt} is null
+          and ${table.status} in ('backlog', 'todo', 'in_progress', 'in_review', 'blocked')`,
+      ),
   }),
 );
