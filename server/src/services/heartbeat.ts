@@ -136,6 +136,7 @@ import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
@@ -2147,9 +2148,11 @@ export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeSe
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  toolDispatcher?: PluginToolDispatcher;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  const toolDispatcher = options.toolDispatcher;
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
@@ -5760,12 +5763,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      // Gather plugin tools if dispatcher is available
+      const pluginTools = toolDispatcher?.listToolsForAgent() ?? [];
+
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
         runtime: runtimeForAdapter,
         config: runtimeConfig,
-        context,
+        context: { ...context, pluginTools },
         executionTarget,
         executionTransport: remoteExecution
           ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
