@@ -138,14 +138,17 @@ export async function prepareCursorSandboxCommand(input: {
   const runtimeEnv = ensurePathInEnv(input.env);
   const currentPath = runtimeEnv.PATH ?? runtimeEnv.Path ?? "";
   const nextPath = prependPosixPathEntry(currentPath, remoteLocalBinDir);
-  const env = nextPath === currentPath ? input.env : { ...input.env, PATH: nextPath };
+  const hadPathInInput = typeof input.env.PATH === "string" || typeof input.env.Path === "string";
+  const baseEnv = hadPathInInput ? input.env : { ...input.env, PATH: currentPath };
+  const env = nextPath === currentPath ? baseEnv : { ...baseEnv, PATH: nextPath };
+  const addedPathEntry = nextPath === currentPath && hadPathInInput ? null : remoteLocalBinDir;
 
   if (!runtimeInfo.preferredCommandPath) {
     return {
       command: input.command,
       env,
       remoteSystemHomeDir,
-      addedPathEntry: nextPath === currentPath ? null : remoteLocalBinDir,
+      addedPathEntry,
       preferredCommandPath: null,
     };
   }
@@ -154,7 +157,7 @@ export async function prepareCursorSandboxCommand(input: {
     command: runtimeInfo.preferredCommandPath,
     env,
     remoteSystemHomeDir,
-    addedPathEntry: nextPath === currentPath ? null : remoteLocalBinDir,
+    addedPathEntry,
     preferredCommandPath: runtimeInfo.preferredCommandPath,
   };
 }
