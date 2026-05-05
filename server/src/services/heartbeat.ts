@@ -61,6 +61,7 @@ import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
+import { providerRateLimitService } from "./provider-rate-limits.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
@@ -2335,6 +2336,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  const providerRateLimits = providerRateLimitService(db);
   const recovery = recoveryService(db, { enqueueWakeup });
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
@@ -7910,6 +7912,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
             });
           }
+        } else if (outcome === "failed" && adapterResult.rateLimitBlock) {
+          const rlb = adapterResult.rateLimitBlock;
+          const scope = await providerRateLimits.deriveBlockScope(agent.adapterType, {
+            limitKind: rlb.limitKind,
+            modelFamily: rlb.modelFamily ?? null,
+            resetsAt: rlb.resetsAt ?? null,
+          });
+          await providerRateLimits.upsertBlock({
+            companyId: agent.companyId,
+            adapterType: agent.adapterType,
+            limitKind: scope.limitKind,
+            modelFamily: scope.modelFamily,
+            message: rlb.message,
+            resetsAt: scope.resetsAt,
+          });
+          await providerRateLimits.pauseAgentsForBlock(
+            agent.companyId, agent.adapterType, scope.modelFamily,
+          );
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
@@ -9752,6 +9772,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const issueMonitors = await tickDueIssueMonitors(now);
+
+      // Auto-resolve expired provider rate-limit blocks.
+      const expiredBlocks = await providerRateLimits.resolveExpiredBlocks(now);
+      for (const block of expiredBlocks) {
+        const stillBlocked = await providerRateLimits.isWindowStillBlocked(
+          block.adapterType, block.limitKind,
+        );
+        if (!stillBlocked) {
+          await providerRateLimits.releaseAndResumeForBlock(block);
+        }
+      }
 
       return {
         checked: checked + issueMonitors.checked,
