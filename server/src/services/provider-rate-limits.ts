@@ -1,7 +1,46 @@
-import { and, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, issues, providerRateLimitBlocks } from "@paperclipai/db";
 import { fetchAllQuotaWindows } from "./quota-windows.js";
+import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/shared";
+
+function providerSlugForAdapterType(adapterType: string): string {
+  if (adapterType === "claude_local") return "anthropic";
+  if (adapterType === "codex_local") return "openai";
+  return adapterType;
+}
+
+function hasPositiveMoneyValue(label: string | null | undefined): boolean {
+  if (!label) return false;
+  const match = label.match(/(?:\$|€|£)?\s*(\d+(?:\.\d+)?)/);
+  if (!match) return false;
+  const amount = Number(match[1]);
+  return Number.isFinite(amount) && amount > 0;
+}
+
+function windowShowsUsablePaidOverflow(window: QuotaWindow): boolean {
+  const windowId = window.windowId?.toLowerCase() ?? "";
+  const label = window.label.toLowerCase();
+  const valueLabel = window.valueLabel?.toLowerCase() ?? "";
+  const detail = window.detail?.toLowerCase() ?? "";
+
+  if (windowId === "extra_usage" || label.includes("extra usage")) {
+    if (valueLabel.includes("not enabled") || detail.includes("not enabled")) return false;
+    if (window.usedPercent == null) return hasPositiveMoneyValue(window.valueLabel);
+    return window.usedPercent < 100;
+  }
+
+  if (windowId === "credits" || label.includes("credits")) {
+    if (valueLabel.includes("n/a") || valueLabel.includes("not enabled")) return false;
+    return hasPositiveMoneyValue(window.valueLabel);
+  }
+
+  return false;
+}
+
+function providerHasUsablePaidOverflow(providerResult: ProviderQuotaResult): boolean {
+  return providerResult.windows.some(windowShowsUsablePaidOverflow);
+}
 
 export function providerRateLimitService(db: Db) {
   async function upsertBlock(input: {
@@ -80,17 +119,16 @@ export function providerRateLimitService(db: Db) {
       );
   }
 
-  async function resolveExpiredBlocks(now: Date) {
+  async function listResetDueActiveBlocks(now: Date) {
     return db
-      .update(providerRateLimitBlocks)
-      .set({ resolvedAt: now, resolvedBy: "system", updatedAt: now })
+      .select()
+      .from(providerRateLimitBlocks)
       .where(
         and(
           isNull(providerRateLimitBlocks.resolvedAt),
-          lt(providerRateLimitBlocks.resetsAt, now),
+          lte(providerRateLimitBlocks.resetsAt, now),
         ),
-      )
-      .returning();
+      );
   }
 
   async function resolveBlock(blockId: string, resolvedBy: string) {
@@ -127,10 +165,11 @@ export function providerRateLimitService(db: Db) {
         )
       : baseFilter;
 
-    await db
+    return db
       .update(agents)
       .set({ status: "paused", pauseReason: "provider_rate_limit", pausedAt: now, updatedAt: now })
-      .where(filter);
+      .where(filter)
+      .returning();
   }
 
   async function resumeAgentsForBlock(
@@ -163,12 +202,13 @@ export function providerRateLimitService(db: Db) {
   async function isWindowStillBlocked(adapterType: string, limitKind: string): Promise<boolean> {
     try {
       const results = await fetchAllQuotaWindows();
-      const providerSlug = adapterType === "claude_local" ? "anthropic" : adapterType === "codex_local" ? "openai" : adapterType;
+      const providerSlug = providerSlugForAdapterType(adapterType);
       const providerResult = results.find((r) => r.provider === providerSlug);
       if (!providerResult?.ok) return true; // Cannot verify → assume still blocked
       const window = providerResult.windows.find((w) => w.windowId === limitKind);
       if (!window) return false; // Window no longer reported → assume released
-      return (window.usedPercent ?? 0) >= 100;
+      if ((window.usedPercent ?? 0) < 100) return false;
+      return !providerHasUsablePaidOverflow(providerResult);
     } catch {
       return true; // Quota probe failed → assume still blocked
     }
@@ -196,7 +236,7 @@ export function providerRateLimitService(db: Db) {
           eq(issues.status, "blocked"),
           inArray(issues.assigneeAgentId, resumedAgentIds),
           // Only unblock issues that became blocked after the rate limit was created.
-          or(isNull(issues.updatedAt), sql`${issues.updatedAt} >= ${block.createdAt}`),
+          or(isNull(issues.updatedAt), gte(issues.updatedAt, block.createdAt)),
         ),
       );
   }
@@ -212,11 +252,11 @@ export function providerRateLimitService(db: Db) {
     if (limitKind === "generic") {
       try {
         const results = await fetchAllQuotaWindows();
-        const providerSlug = adapterType === "claude_local" ? "anthropic" : adapterType === "codex_local" ? "openai" : adapterType;
+        const providerSlug = providerSlugForAdapterType(adapterType);
         const providerResult = results.find((r) => r.provider === providerSlug && r.ok);
         if (providerResult) {
           const exhausted = providerResult.windows.find(
-            (w) => w.windowId && (w.usedPercent ?? 0) >= 100,
+            (w) => w.windowId && (w.usedPercent ?? 0) >= 100 && !windowShowsUsablePaidOverflow(w),
           );
           if (exhausted?.windowId) {
             limitKind = exhausted.windowId;
@@ -238,7 +278,7 @@ export function providerRateLimitService(db: Db) {
     upsertBlock,
     getActiveBlockForAgent,
     listActiveBlocks,
-    resolveExpiredBlocks,
+    listResetDueActiveBlocks,
     resolveBlock,
     pauseAgentsForBlock,
     resumeAgentsForBlock,

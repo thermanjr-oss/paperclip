@@ -7927,9 +7927,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             message: rlb.message,
             resetsAt: scope.resetsAt,
           });
-          await providerRateLimits.pauseAgentsForBlock(
+          const pausedAgents = await providerRateLimits.pauseAgentsForBlock(
             agent.companyId, agent.adapterType, scope.modelFamily,
           );
+          for (const pausedAgent of pausedAgents) {
+            await cancelActiveForAgentInternal(
+              pausedAgent.id,
+              `Cancelled due to provider rate limit (${scope.limitKind})`,
+            );
+          }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
@@ -9773,13 +9779,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const issueMonitors = await tickDueIssueMonitors(now);
 
-      // Auto-resolve expired provider rate-limit blocks.
-      const expiredBlocks = await providerRateLimits.resolveExpiredBlocks(now);
-      for (const block of expiredBlocks) {
+      // Auto-resolve only after probing confirms the provider window has reopened.
+      const resetDueBlocks = await providerRateLimits.listResetDueActiveBlocks(now);
+      for (const block of resetDueBlocks) {
         const stillBlocked = await providerRateLimits.isWindowStillBlocked(
           block.adapterType, block.limitKind,
         );
         if (!stillBlocked) {
+          await providerRateLimits.resolveBlock(block.id, "system");
           await providerRateLimits.releaseAndResumeForBlock(block);
         }
       }
