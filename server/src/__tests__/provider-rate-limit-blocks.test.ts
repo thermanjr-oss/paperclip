@@ -9,6 +9,7 @@ import {
   createDb,
   heartbeatRuns,
   issues,
+  issueRelations,
   providerRateLimitBlockMembers,
   providerRateLimitBlocks,
 } from "@paperclipai/db";
@@ -50,6 +51,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(providerRateLimitBlockMembers);
     await db.delete(providerRateLimitBlocks);
@@ -177,6 +179,211 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
         ),
       );
     expect(activeBlocks).toHaveLength(0);
+  });
+
+  it("queues one provider reset wakeup for the current issue assignee", async () => {
+    const svc = providerRateLimitService(db);
+    const now = new Date("2026-05-06T12:40:00.000Z");
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const staleAgentId = randomUUID();
+    const issueId = randomUUID();
+    const blockId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "paused",
+        pauseReason: "provider_rate_limit",
+        pausedAt: new Date(now.getTime() - 60_000),
+        adapterType: "claude_local",
+        adapterConfig: { model: "claude-sonnet-4-6" },
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: staleAgentId,
+        companyId,
+        name: "CMO",
+        role: "cmo",
+        status: "paused",
+        pauseReason: "provider_rate_limit",
+        pausedAt: new Date(now.getTime() - 60_000),
+        adapterType: "claude_local",
+        adapterConfig: { model: "claude-sonnet-4-6" },
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Continue after provider reset",
+      status: "blocked",
+      assigneeAgentId,
+    });
+
+    const [block] = await db
+      .insert(providerRateLimitBlocks)
+      .values({
+        id: blockId,
+        companyId,
+        adapterType: "claude_local",
+        limitKind: "five_hour",
+        modelFamily: null,
+        resetsAt: new Date(now.getTime() - 1_000),
+        resolvedAt: now,
+        resolvedBy: "test",
+        message: "You've hit your limit - resets 2:40pm",
+      })
+      .returning();
+
+    await db.insert(providerRateLimitBlockMembers).values([
+      {
+        blockId,
+        companyId,
+        agentId: staleAgentId,
+        issueId,
+        releaseStatus: "pending",
+        updatedAt: now,
+      },
+      {
+        blockId,
+        companyId,
+        agentId: assigneeAgentId,
+        issueId,
+        releaseStatus: "pending",
+        updatedAt: now,
+      },
+    ]);
+
+    const release = await svc.releaseAndResumeForBlock(block!);
+    expect(release.wakeupsQueued).toBe(1);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "provider_rate_limit_reset"));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.agentId).toBe(assigneeAgentId);
+    expect(wakeups[0]?.idempotencyKey).toBe(`provider_rate_limit_reset:${blockId}:${issueId}:${assigneeAgentId}`);
+
+    const staleMember = await db
+      .select()
+      .from(providerRateLimitBlockMembers)
+      .where(and(eq(providerRateLimitBlockMembers.blockId, blockId), eq(providerRateLimitBlockMembers.agentId, staleAgentId)))
+      .then((rows) => rows[0] ?? null);
+    expect(staleMember?.releaseReason).toBe("issue_assignee_mismatch");
+
+    const assigneeMember = await db
+      .select()
+      .from(providerRateLimitBlockMembers)
+      .where(and(eq(providerRateLimitBlockMembers.blockId, blockId), eq(providerRateLimitBlockMembers.agentId, assigneeAgentId)))
+      .then((rows) => rows[0] ?? null);
+    expect(assigneeMember?.wakeupRequestId).toBe(wakeups[0]?.id);
+  });
+
+  it("skips provider reset wakeup when issue dependencies are unresolved", async () => {
+    const svc = providerRateLimitService(db);
+    const now = new Date("2026-05-06T12:40:00.000Z");
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const blockId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "paused",
+      pauseReason: "provider_rate_limit",
+      pausedAt: new Date(now.getTime() - 60_000),
+      adapterType: "claude_local",
+      adapterConfig: { model: "claude-sonnet-4-6" },
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Approval gate",
+        status: "blocked",
+      },
+      {
+        id: issueId,
+        companyId,
+        title: "Continue after provider reset",
+        status: "blocked",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const [block] = await db
+      .insert(providerRateLimitBlocks)
+      .values({
+        id: blockId,
+        companyId,
+        adapterType: "claude_local",
+        limitKind: "five_hour",
+        modelFamily: null,
+        resetsAt: new Date(now.getTime() - 1_000),
+        resolvedAt: now,
+        resolvedBy: "test",
+      })
+      .returning();
+
+    await db.insert(providerRateLimitBlockMembers).values({
+      blockId,
+      companyId,
+      agentId,
+      issueId,
+      releaseStatus: "pending",
+      updatedAt: now,
+    });
+
+    const release = await svc.releaseAndResumeForBlock(block!);
+    expect(release.wakeupsQueued).toBe(0);
+    expect(release.wakeupsSkipped).toBe(1);
+
+    const wakeups = await db.select().from(agentWakeupRequests);
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.status).toBe("skipped");
+    expect(wakeups[0]?.reason).toBe("issue_dependencies_blocked");
+    expect(wakeups[0]?.payload).toMatchObject({
+      issueId,
+      unresolvedBlockerIssueIds: [blockerIssueId],
+    });
+
+    const runs = await db.select().from(heartbeatRuns);
+    expect(runs).toHaveLength(0);
   });
 
   it("coalesces repeated hits into the same active block without moving createdAt", async () => {

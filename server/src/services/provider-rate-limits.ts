@@ -19,8 +19,8 @@ function isoOrNull(value: Date | null | undefined): string | null {
   return value ? value.toISOString() : null;
 }
 
-function jitteredWakeTime(blockId: string, agentId: string, now: Date): Date {
-  const seed = `${blockId}:${agentId}`;
+function jitteredWakeTime(blockId: string, agentId: string, now: Date, issueId?: string | null): Date {
+  const seed = `${blockId}:${issueId ?? "agent"}:${agentId}`;
   let hash = 0;
   for (let i = 0; i < seed.length; i += 1) {
     hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
@@ -293,7 +293,7 @@ export function providerRateLimitService(db: Db) {
             where ${issueRelations.companyId} = ${issues.companyId}
               and ${issueRelations.type} = 'blocks'
               and ${issueRelations.relatedIssueId} = ${issues.id}
-              and blocker_issues.status not in ('done', 'cancelled')
+              and blocker_issues.status <> 'done'
           )`,
           sql`not exists (
             select 1
@@ -515,7 +515,9 @@ export function providerRateLimitService(db: Db) {
     issueId: string | null;
     now: Date;
   }) {
-    const idempotencyKey = `provider_rate_limit_reset:${input.block.id}:${input.agent.id}`;
+    const idempotencyKey = input.issueId
+      ? `provider_rate_limit_reset:${input.block.id}:${input.issueId}:${input.agent.id}`
+      : `provider_rate_limit_reset:${input.block.id}:${input.agent.id}`;
     const existing = await db
       .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId, status: agentWakeupRequests.status })
       .from(agentWakeupRequests)
@@ -529,7 +531,7 @@ export function providerRateLimitService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (existing) return { queued: false, wakeupRequestId: existing.id, reason: "duplicate" };
 
-    const scheduledAt = jitteredWakeTime(input.block.id, input.agent.id, input.now);
+    const scheduledAt = jitteredWakeTime(input.block.id, input.agent.id, input.now, input.issueId);
     const wakeupRequest = await db
       .insert(agentWakeupRequests)
       .values({
@@ -605,6 +607,57 @@ export function providerRateLimitService(db: Db) {
     return { queued: true, wakeupRequestId: wakeupRequest.id, reason: "queued" };
   }
 
+  async function recordSkippedProviderResetWakeup(input: {
+    block: BlockRow;
+    agent: typeof agents.$inferSelect;
+    issueId: string;
+    reason: string;
+    unresolvedBlockerIssueIds?: string[];
+    now: Date;
+  }) {
+    const idempotencyKey = `provider_rate_limit_reset_skipped:${input.block.id}:${input.issueId}:${input.agent.id}:${input.reason}`;
+    const existing = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.block.companyId),
+          eq(agentWakeupRequests.agentId, input.agent.id),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (existing) return existing.id;
+
+    const [wakeup] = await db
+      .insert(agentWakeupRequests)
+      .values({
+        companyId: input.block.companyId,
+        agentId: input.agent.id,
+        source: "automation",
+        triggerDetail: "system",
+        reason: input.reason,
+        payload: {
+          blockId: input.block.id,
+          adapterType: input.block.adapterType,
+          limitKind: input.block.limitKind,
+          modelFamily: input.block.modelFamily,
+          issueId: input.issueId,
+          unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds ?? [],
+        },
+        status: "skipped",
+        requestedByActorType: "system",
+        requestedByActorId: "provider_rate_limit_service",
+        idempotencyKey,
+        requestedAt: input.now,
+        finishedAt: input.now,
+        error: input.reason,
+        updatedAt: input.now,
+      })
+      .returning();
+    return wakeup!.id;
+  }
+
   async function memberRowsForRelease(block: BlockRow) {
     const members = await db
       .select()
@@ -641,12 +694,41 @@ export function providerRateLimitService(db: Db) {
       ? await db.select().from(agents).where(inArray(agents.id, agentIds))
       : [];
     const agentById = new Map(agentRows.map((agent) => [agent.id, agent]));
-    const issueByAgent = new Map<string, string | null>();
-    for (const member of members) {
-      if (!issueByAgent.has(member.agentId) && member.issueId) {
-        issueByAgent.set(member.agentId, member.issueId);
-      }
+    const memberIssueIds = [...new Set(members.map((member) => member.issueId).filter(Boolean) as string[])];
+    const issueRows = memberIssueIds.length > 0
+      ? await db
+        .select({
+          id: issues.id,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, block.companyId), inArray(issues.id, memberIssueIds)))
+      : [];
+    const issueById = new Map(issueRows.map((issue) => [issue.id, issue]));
+    const unresolvedBlockerRows = memberIssueIds.length > 0
+      ? await db
+        .select({
+          issueId: issueRelations.relatedIssueId,
+          blockerIssueId: issueRelations.issueId,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, block.companyId),
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, memberIssueIds),
+            sql`${issues.status} <> 'done'`,
+          ),
+        )
+      : [];
+    const unresolvedBlockersByIssueId = new Map<string, string[]>();
+    for (const row of unresolvedBlockerRows) {
+      const current = unresolvedBlockersByIssueId.get(row.issueId) ?? [];
+      current.push(row.blockerIssueId);
+      unresolvedBlockersByIssueId.set(row.issueId, current);
     }
+    const queuedIssueIds = new Set<string>();
 
     let resumed = 0;
     let wakeupsQueued = 0;
@@ -699,10 +781,120 @@ export function providerRateLimitService(db: Db) {
       }
 
       if (releaseStatus === "resumed" || releaseStatus === "ready") {
+        const memberIssueId = member.issueId;
+        if (memberIssueId) {
+          const issue = issueById.get(memberIssueId);
+          if (!issue) {
+            wakeupsSkipped += 1;
+            await db
+              .update(providerRateLimitBlockMembers)
+              .set({
+                releaseStatus: "skipped",
+                releaseReason: "issue_missing",
+                updatedAt: now,
+              })
+              .where(eq(providerRateLimitBlockMembers.id, member.id));
+            await writeActivity({
+              companyId: block.companyId,
+              action: "provider_rate_limit.wakeup_skipped",
+              entityId: block.id,
+              agentId: agent.id,
+              details: {
+                reason: "issue_missing",
+                issueId: memberIssueId,
+              },
+            });
+            continue;
+          }
+
+          if (issue.assigneeAgentId !== agent.id) {
+            wakeupsSkipped += 1;
+            await db
+              .update(providerRateLimitBlockMembers)
+              .set({
+                releaseStatus,
+                releaseReason: "issue_assignee_mismatch",
+                updatedAt: now,
+              })
+              .where(eq(providerRateLimitBlockMembers.id, member.id));
+            await writeActivity({
+              companyId: block.companyId,
+              action: "provider_rate_limit.wakeup_skipped",
+              entityId: block.id,
+              agentId: agent.id,
+              details: {
+                reason: "issue_assignee_mismatch",
+                issueId: memberIssueId,
+                currentAssigneeAgentId: issue.assigneeAgentId,
+              },
+            });
+            continue;
+          }
+
+          const unresolvedBlockerIssueIds = unresolvedBlockersByIssueId.get(memberIssueId) ?? [];
+          if (unresolvedBlockerIssueIds.length > 0) {
+            wakeupsSkipped += 1;
+            const wakeupRequestId = await recordSkippedProviderResetWakeup({
+              block,
+              agent,
+              issueId: memberIssueId,
+              reason: "issue_dependencies_blocked",
+              unresolvedBlockerIssueIds,
+              now,
+            });
+            await db
+              .update(providerRateLimitBlockMembers)
+              .set({
+                releaseStatus,
+                releaseReason: "issue_dependencies_blocked",
+                wakeupRequestId,
+                updatedAt: now,
+              })
+              .where(eq(providerRateLimitBlockMembers.id, member.id));
+            await writeActivity({
+              companyId: block.companyId,
+              action: "provider_rate_limit.wakeup_skipped",
+              entityId: block.id,
+              agentId: agent.id,
+              details: {
+                reason: "issue_dependencies_blocked",
+                issueId: memberIssueId,
+                unresolvedBlockerIssueIds,
+                wakeupRequestId,
+              },
+            });
+            continue;
+          }
+
+          if (queuedIssueIds.has(memberIssueId)) {
+            wakeupsSkipped += 1;
+            await db
+              .update(providerRateLimitBlockMembers)
+              .set({
+                releaseStatus,
+                releaseReason: "issue_reset_already_queued",
+                updatedAt: now,
+              })
+              .where(eq(providerRateLimitBlockMembers.id, member.id));
+            await writeActivity({
+              companyId: block.companyId,
+              action: "provider_rate_limit.wakeup_skipped",
+              entityId: block.id,
+              agentId: agent.id,
+              details: {
+                reason: "issue_reset_already_queued",
+                issueId: memberIssueId,
+              },
+            });
+            continue;
+          }
+          queuedIssueIds.add(memberIssueId);
+        }
+
         const wakeup = await queueProviderResetWakeup({
           block,
           agent: currentAgent,
-          issueId: issueByAgent.get(agent.id) ?? null,
+          issueId: member.issueId ?? null,
           now,
         });
         if (wakeup.queued) {
@@ -745,7 +937,6 @@ export function providerRateLimitService(db: Db) {
       }
     }
 
-    const memberIssueIds = [...new Set(members.map((member) => member.issueId).filter(Boolean) as string[])];
     if (memberIssueIds.length > 0) {
       await db
         .update(issues)
@@ -763,7 +954,7 @@ export function providerRateLimitService(db: Db) {
               where ${issueRelations.companyId} = ${block.companyId}
                 and ${issueRelations.type} = 'blocks'
                 and ${issueRelations.relatedIssueId} = ${issues.id}
-                and blocker_issues.status not in ('done', 'cancelled')
+                and blocker_issues.status <> 'done'
             )`,
           ),
         );
@@ -785,7 +976,7 @@ export function providerRateLimitService(db: Db) {
               where ${issueRelations.companyId} = ${block.companyId}
                 and ${issueRelations.type} = 'blocks'
                 and ${issueRelations.relatedIssueId} = ${issues.id}
-                and blocker_issues.status not in ('done', 'cancelled')
+                and blocker_issues.status <> 'done'
             )`,
           ),
         );

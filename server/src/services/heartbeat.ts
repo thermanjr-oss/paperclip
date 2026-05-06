@@ -5776,6 +5776,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  async function claimQueuedRunWithConcurrencyGuard(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    claimedAt: Date,
+  ) {
+    const policy = parseHeartbeatPolicy(agent);
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${run.agentId}))`);
+
+      const [{ count }] = await tx
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running")));
+      const runningCount = Number(count ?? 0);
+      if (runningCount >= policy.maxConcurrentRuns) {
+        return null;
+      }
+
+      const claimed = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!claimed) return null;
+
+      const claimedIssueId = readNonEmptyString(parseObject(claimed.contextSnapshot).issueId);
+      if (claimedIssueId) {
+        await tx
+          .update(issues)
+          .set({
+            executionRunId: claimed.id,
+            executionAgentNameKey: normalizeAgentNameKey(agent.name),
+            executionLockedAt: claimedAt,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(issues.id, claimedIssueId),
+              eq(issues.companyId, claimed.companyId),
+              // Mention/context runs can touch an issue, but only the current assignee
+              // owns the issue execution lock shown as the active run.
+              eq(issues.assigneeAgentId, claimed.agentId),
+              or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
+            ),
+          );
+      }
+
+      return claimed;
+    });
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -5852,17 +5908,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const claimedAt = new Date();
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!claimed) return null;
+    const claimed = await claimQueuedRunWithConcurrencyGuard(run, agent, claimedAt);
+    if (!claimed) {
+      logger.info({ runId: run.id, agentId: run.agentId }, "claimQueuedRun: max concurrent runs reached or run no longer queued");
+      return null;
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -5882,31 +5932,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     publishRunLifecyclePluginEvent(claimed);
 
     await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
-
-    // Fix A (lazy locking): stamp executionRunId now that the run is actually running,
-    // not at queue time. Guard is idempotent — safe if called more than once.
-    const claimedIssueId = readNonEmptyString(parseObject(claimed.contextSnapshot).issueId);
-    if (claimedIssueId) {
-      const claimedAgent = await getAgent(claimed.agentId);
-      await db
-        .update(issues)
-        .set({
-          executionRunId: claimed.id,
-          executionAgentNameKey: normalizeAgentNameKey(claimedAgent?.name),
-          executionLockedAt: claimedAt,
-          updatedAt: claimedAt,
-        })
-        .where(
-          and(
-            eq(issues.id, claimedIssueId),
-            eq(issues.companyId, claimed.companyId),
-            // Mention/context runs can touch an issue, but only the current assignee
-            // owns the issue execution lock shown as the active run.
-            eq(issues.assigneeAgentId, claimed.agentId),
-            or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
-          ),
-        );
-    }
 
     return claimed;
   }
