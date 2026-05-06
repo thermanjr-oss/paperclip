@@ -6,6 +6,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
   providerRateLimitBlocks,
 } from "@paperclipai/db";
 import {
@@ -13,6 +14,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { providerRateLimitService } from "../services/provider-rate-limits.ts";
 
 const mockFetchAllQuotaWindows = vi.hoisted(() => vi.fn());
 
@@ -43,6 +45,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
   afterEach(async () => {
     mockFetchAllQuotaWindows.mockReset();
     await db.delete(heartbeatRuns);
+    await db.delete(issues);
     await db.delete(providerRateLimitBlocks);
     await db.delete(agents);
     await db.delete(companies);
@@ -127,7 +130,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     return { companyId, agentId, blockId, now };
   }
 
-  it("keeps a reset-due block active when provider quota is still exhausted", async () => {
+  it("resolves a reset-due block even when provider quota still appears exhausted", async () => {
     const { companyId, agentId, blockId, now } = await seedPausedClaudeAgentWithDueBlock({
       usedPercent: 100,
     });
@@ -138,11 +141,11 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
       .select()
       .from(providerRateLimitBlocks)
       .where(eq(providerRateLimitBlocks.id, blockId));
-    expect(block?.resolvedAt).toBeNull();
+    expect(block?.resolvedAt).toBeInstanceOf(Date);
 
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
-    expect(agent?.status).toBe("paused");
-    expect(agent?.pauseReason).toBe("provider_rate_limit");
+    expect(agent?.status).toBe("idle");
+    expect(agent?.pauseReason).toBeNull();
 
     const activeBlocks = await db
       .select()
@@ -153,7 +156,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
           isNull(providerRateLimitBlocks.resolvedAt),
         ),
       );
-    expect(activeBlocks).toHaveLength(1);
+    expect(activeBlocks).toHaveLength(0);
   });
 
   it("resolves and resumes only after the provider quota probe reports capacity", async () => {
@@ -205,7 +208,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     expect(agent?.pauseReason).toBeNull();
   });
 
-  it("keeps a Claude block when extra usage is disabled", async () => {
+  it("resolves a reset-due Claude block even when extra usage is disabled", async () => {
     const { agentId, blockId, now } = await seedPausedClaudeAgentWithDueBlock({
       limitKind: "seven_day",
       usedPercent: 100,
@@ -227,11 +230,11 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
       .select()
       .from(providerRateLimitBlocks)
       .where(eq(providerRateLimitBlocks.id, blockId));
-    expect(block?.resolvedAt).toBeNull();
+    expect(block?.resolvedAt).toBeInstanceOf(Date);
 
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
-    expect(agent?.status).toBe("paused");
-    expect(agent?.pauseReason).toBe("provider_rate_limit");
+    expect(agent?.status).toBe("idle");
+    expect(agent?.pauseReason).toBeNull();
   });
 
   it("resolves a Codex weekly block when paid credits remain", async () => {
@@ -263,5 +266,45 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     expect(agent?.status).toBe("idle");
     expect(agent?.pauseReason).toBeNull();
+  });
+
+  it("unblocks issues when a released block has no matching agents left", async () => {
+    const svc = providerRateLimitService(db);
+    const now = new Date("2026-05-06T07:32:00.000Z");
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const [block] = await db
+      .insert(providerRateLimitBlocks)
+      .values({
+        companyId,
+        adapterType: "claude_local",
+        limitKind: "five_hour",
+        modelFamily: null,
+        resetsAt: new Date(now.getTime() - 1_000),
+        createdAt: new Date(now.getTime() - 60_000),
+        updatedAt: now,
+      })
+      .returning();
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Continue after provider reset",
+      status: "blocked",
+      updatedAt: now,
+    });
+
+    await svc.releaseAndResumeForBlock(block!);
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue?.status).toBe("in_progress");
   });
 });

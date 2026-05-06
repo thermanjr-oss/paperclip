@@ -119,6 +119,14 @@ export function providerRateLimitService(db: Db) {
       );
   }
 
+  async function getBlock(blockId: string) {
+    return db
+      .select()
+      .from(providerRateLimitBlocks)
+      .where(eq(providerRateLimitBlocks.id, blockId))
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function listResetDueActiveBlocks(now: Date) {
     return db
       .select()
@@ -199,6 +207,30 @@ export function providerRateLimitService(db: Db) {
       .returning();
   }
 
+  async function listAgentIdsForBlockScope(
+    companyId: string,
+    adapterType: string,
+    modelFamily: string | null,
+  ) {
+    const baseFilter = and(
+      eq(agents.companyId, companyId),
+      eq(agents.adapterType, adapterType),
+    );
+
+    const filter = modelFamily
+      ? and(
+          baseFilter,
+          sql`lower(${agents.adapterConfig}->>'model') LIKE lower(${modelFamily + "%"})`,
+        )
+      : baseFilter;
+
+    return db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(filter)
+      .then((rows) => rows.map((row) => row.id));
+  }
+
   async function isWindowStillBlocked(adapterType: string, limitKind: string): Promise<boolean> {
     try {
       const results = await fetchAllQuotaWindows();
@@ -217,16 +249,27 @@ export function providerRateLimitService(db: Db) {
   async function releaseAndResumeForBlock(
     block: typeof providerRateLimitBlocks.$inferSelect,
   ) {
-    const resumedAgents = await resumeAgentsForBlock(
-      block.companyId,
-      block.adapterType,
-      block.modelFamily,
-    );
-    if (resumedAgents.length === 0) return;
+    const [resumedAgents, scopedAgentIds] = await Promise.all([
+      resumeAgentsForBlock(
+        block.companyId,
+        block.adapterType,
+        block.modelFamily,
+      ),
+      listAgentIdsForBlockScope(
+        block.companyId,
+        block.adapterType,
+        block.modelFamily,
+      ),
+    ]);
 
-    const resumedAgentIds = resumedAgents.map((a) => a.id);
+    const agentIds = [...new Set([...scopedAgentIds, ...resumedAgents.map((a) => a.id)])];
     const now = new Date();
-    // Unblock issues that were blocked after the rate limit started and belong to resumed agents.
+    const assigneeScope = agentIds.length > 0
+      ? inArray(issues.assigneeAgentId, agentIds)
+      : undefined;
+    // Unblock issues that were blocked after the rate limit started. When matching
+    // agents no longer exist, fall back to the time/company scope so release still
+    // clears issue state instead of leaving work blocked forever.
     await db
       .update(issues)
       .set({ status: "in_progress", updatedAt: now })
@@ -234,7 +277,7 @@ export function providerRateLimitService(db: Db) {
         and(
           eq(issues.companyId, block.companyId),
           eq(issues.status, "blocked"),
-          inArray(issues.assigneeAgentId, resumedAgentIds),
+          assigneeScope,
           // Only unblock issues that became blocked after the rate limit was created.
           or(isNull(issues.updatedAt), gte(issues.updatedAt, block.createdAt)),
         ),
@@ -276,6 +319,7 @@ export function providerRateLimitService(db: Db) {
 
   return {
     upsertBlock,
+    getBlock,
     getActiveBlockForAgent,
     listActiveBlocks,
     listResetDueActiveBlocks,

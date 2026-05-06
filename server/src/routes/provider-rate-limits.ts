@@ -23,7 +23,7 @@ export function providerRateLimitRoutes(db: Db) {
     const actor = getActorInfo(req);
     const resolvedBy = actor.actorType === "user" ? `manual:${actor.actorId}` : "manual";
 
-    const block = await svc.resolveBlock(blockId, resolvedBy);
+    const block = await svc.getBlock(blockId);
     if (!block || block.companyId !== companyId) {
       throw notFound("Rate limit block not found");
     }
@@ -42,7 +42,11 @@ export function providerRateLimitRoutes(db: Db) {
       return;
     }
 
-    await svc.releaseAndResumeForBlock(block);
+    const resolvedBlock = await svc.resolveBlock(block.id, resolvedBy);
+    if (!resolvedBlock) {
+      throw notFound("Rate limit block not found");
+    }
+    await svc.releaseAndResumeForBlock(resolvedBlock);
     res.json({ released: true });
   });
 

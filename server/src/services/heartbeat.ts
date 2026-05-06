@@ -9779,16 +9779,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const issueMonitors = await tickDueIssueMonitors(now);
 
-      // Auto-resolve only after probing confirms the provider window has reopened.
+      // Provider reset times come from the provider; do not make recovery depend on
+      // a fresh quota probe being available at the exact expiry tick.
       const resetDueBlocks = await providerRateLimits.listResetDueActiveBlocks(now);
       for (const block of resetDueBlocks) {
-        const stillBlocked = await providerRateLimits.isWindowStillBlocked(
-          block.adapterType, block.limitKind,
-        );
-        if (!stillBlocked) {
-          await providerRateLimits.resolveBlock(block.id, "system");
-          await providerRateLimits.releaseAndResumeForBlock(block);
-        }
+        const resolvedBlock = await providerRateLimits.resolveBlock(block.id, "system");
+        if (resolvedBlock) await providerRateLimits.releaseAndResumeForBlock(resolvedBlock);
       }
 
       return {
