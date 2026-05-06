@@ -3,10 +3,13 @@ import { and, eq, isNull } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  agentWakeupRequests,
+  activityLog,
   companies,
   createDb,
   heartbeatRuns,
   issues,
+  providerRateLimitBlockMembers,
   providerRateLimitBlocks,
 } from "@paperclipai/db";
 import {
@@ -44,8 +47,11 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
 
   afterEach(async () => {
     mockFetchAllQuotaWindows.mockReset();
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
+    await db.delete(providerRateLimitBlockMembers);
     await db.delete(providerRateLimitBlocks);
     await db.delete(agents);
     await db.delete(companies);
@@ -147,6 +153,20 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     expect(agent?.status).toBe("idle");
     expect(agent?.pauseReason).toBeNull();
 
+    const resetWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "provider_rate_limit_reset")));
+    expect(resetWakeups).toHaveLength(1);
+    expect(resetWakeups[0]?.idempotencyKey).toBe(`provider_rate_limit_reset:${blockId}:${agentId}`);
+
+    const resetRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.wakeupRequestId, resetWakeups[0]!.id));
+    expect(resetRuns).toHaveLength(1);
+    expect(resetRuns[0]?.status).toBe("scheduled_retry");
+
     const activeBlocks = await db
       .select()
       .from(providerRateLimitBlocks)
@@ -157,6 +177,52 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
         ),
       );
     expect(activeBlocks).toHaveLength(0);
+  });
+
+  it("coalesces repeated hits into the same active block without moving createdAt", async () => {
+    const svc = providerRateLimitService(db);
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const firstReset = new Date("2026-05-06T07:00:00.000Z");
+    const first = await svc.upsertBlock({
+      companyId,
+      adapterType: "claude_local",
+      limitKind: "five_hour",
+      modelFamily: "claude-sonnet",
+      message: "first hit",
+      resetsAt: firstReset,
+    });
+    const createdAt = first.createdAt;
+
+    for (let i = 0; i < 9; i += 1) {
+      await svc.upsertBlock({
+        companyId,
+        adapterType: "claude_local",
+        limitKind: "five_hour",
+        modelFamily: "claude-sonnet",
+        message: `hit ${i + 2}`,
+        resetsAt: new Date(firstReset.getTime() + (i + 1) * 60_000),
+      });
+    }
+
+    const blocks = await db
+      .select()
+      .from(providerRateLimitBlocks)
+      .where(and(eq(providerRateLimitBlocks.companyId, companyId), isNull(providerRateLimitBlocks.resolvedAt)));
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]?.id).toBe(first.id);
+    expect(blocks[0]?.hitCount).toBe(10);
+    expect(blocks[0]?.createdAt.getTime()).toBe(createdAt.getTime());
+    expect(blocks[0]?.lastSeenAt.getTime()).toBeGreaterThanOrEqual(createdAt.getTime());
+    expect(blocks[0]?.message).toBe("hit 10");
   });
 
   it("resolves and resumes only after the provider quota probe reports capacity", async () => {
@@ -268,7 +334,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     expect(agent?.pauseReason).toBeNull();
   });
 
-  it("unblocks issues when a released block has no matching agents left", async () => {
+  it("does not unblock unrelated issues when a released block has no members or matching agents", async () => {
     const svc = providerRateLimitService(db);
     const now = new Date("2026-05-06T07:32:00.000Z");
     const companyId = randomUUID();
@@ -305,6 +371,6 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     await svc.releaseAndResumeForBlock(block!);
 
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(issue?.status).toBe("in_progress");
+    expect(issue?.status).toBe("blocked");
   });
 });

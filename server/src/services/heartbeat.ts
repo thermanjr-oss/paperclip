@@ -7919,16 +7919,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             modelFamily: rlb.modelFamily ?? null,
             resetsAt: rlb.resetsAt ?? null,
           });
-          await providerRateLimits.upsertBlock({
+          const contextSnapshot = parseObject(livenessRun.contextSnapshot);
+          const issueId = readNonEmptyString(contextSnapshot.issueId) ?? readNonEmptyString(contextSnapshot.taskId);
+          const block = await providerRateLimits.upsertBlock({
             companyId: agent.companyId,
             adapterType: agent.adapterType,
             limitKind: scope.limitKind,
             modelFamily: scope.modelFamily,
             message: rlb.message,
             resetsAt: scope.resetsAt,
+            agentId: agent.id,
+            issueId,
+            runId: livenessRun.id,
           });
           const pausedAgents = await providerRateLimits.pauseAgentsForBlock(
-            agent.companyId, agent.adapterType, scope.modelFamily,
+            agent.companyId,
+            agent.adapterType,
+            scope.modelFamily,
+            {
+              blockId: block.id,
+              issueId,
+              runId: livenessRun.id,
+            },
           );
           for (const pausedAgent of pausedAgents) {
             await cancelActiveForAgentInternal(
@@ -9745,7 +9757,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     buildRunOutputSilence,
 
+    releaseDueProviderRateLimitBlocks: (now = new Date()) =>
+      providerRateLimits.releaseDueBlocks(now, "system"),
+
+    recoverLegacyProviderRateLimitBlocks: (now = new Date()) =>
+      providerRateLimits.recoverLegacyResolvedBlocks(now),
+
     tickTimers: async (now = new Date()) => {
+      const providerReleases = await providerRateLimits.releaseDueBlocks(now, "system");
       const allAgents = await db.select().from(agents);
       let checked = 0;
       let enqueued = 0;
@@ -9779,18 +9798,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const issueMonitors = await tickDueIssueMonitors(now);
 
-      // Provider reset times come from the provider; do not make recovery depend on
-      // a fresh quota probe being available at the exact expiry tick.
-      const resetDueBlocks = await providerRateLimits.listResetDueActiveBlocks(now);
-      for (const block of resetDueBlocks) {
-        const resolvedBlock = await providerRateLimits.resolveBlock(block.id, "system");
-        if (resolvedBlock) await providerRateLimits.releaseAndResumeForBlock(resolvedBlock);
-      }
-
       return {
         checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
+        enqueued: enqueued + issueMonitors.triggered + providerReleases.wakeupsQueued,
+        skipped: skipped + issueMonitors.skipped + providerReleases.wakeupsSkipped,
       };
     },
 
