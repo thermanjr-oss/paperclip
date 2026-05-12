@@ -11,9 +11,26 @@ import {
   providerRateLimitBlocks,
 } from "@paperclipai/db";
 import { fetchAllQuotaWindows } from "./quota-windows.js";
-import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/shared";
+import { MODEL_PROFILE_KEYS, type ModelProfileKey, type ProviderQuotaResult, type QuotaWindow } from "@paperclipai/shared";
+import { listAdapterModelProfiles } from "../adapters/index.js";
 
 type BlockRow = typeof providerRateLimitBlocks.$inferSelect;
+
+function parseObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function readModelProfileKey(value: unknown): ModelProfileKey | null {
+  return MODEL_PROFILE_KEYS.includes(value as ModelProfileKey)
+    ? value as ModelProfileKey
+    : null;
+}
 
 function isoOrNull(value: Date | null | undefined): string | null {
   return value ? value.toISOString() : null;
@@ -199,6 +216,61 @@ export function providerRateLimitService(db: Db) {
       if (model && model.toLowerCase().startsWith(block.modelFamily.toLowerCase())) return block;
     }
     return null;
+  }
+
+  async function resolveEffectiveRunModel(input: {
+    companyId: string;
+    agent: {
+      adapterType: string;
+      adapterConfig: unknown;
+      runtimeConfig?: unknown;
+    };
+    issueId?: string | null;
+    contextSnapshot?: Record<string, unknown> | null;
+  }) {
+    let issueOverrides: Record<string, unknown> = {};
+    if (input.issueId) {
+      const issue = await db
+        .select({
+          assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+        .then((rows) => rows[0] ?? null);
+      issueOverrides = parseObject(issue?.assigneeAdapterOverrides);
+    }
+
+    const issueModelProfile = readModelProfileKey(issueOverrides.modelProfile);
+    const contextModelProfile = readModelProfileKey(input.contextSnapshot?.modelProfile);
+    const modelProfile = issueModelProfile ?? contextModelProfile;
+
+    let adapterProfileConfig: Record<string, unknown> = {};
+    if (modelProfile) {
+      try {
+        const profiles = await listAdapterModelProfiles(input.agent.adapterType);
+        const profile = profiles.find((candidate) => candidate.key === modelProfile);
+        adapterProfileConfig = parseObject(profile?.adapterConfig);
+      } catch {
+        adapterProfileConfig = {};
+      }
+    }
+
+    let runtimeProfileConfig: Record<string, unknown> = {};
+    if (modelProfile) {
+      const runtimeProfiles = parseObject(parseObject(input.agent.runtimeConfig).modelProfiles);
+      const runtimeProfile = parseObject(runtimeProfiles[modelProfile]);
+      runtimeProfileConfig = runtimeProfile.enabled === false
+        ? {}
+        : parseObject(runtimeProfile.adapterConfig);
+    }
+
+    const effectiveConfig = {
+      ...parseObject(input.agent.adapterConfig),
+      ...adapterProfileConfig,
+      ...runtimeProfileConfig,
+      ...parseObject(issueOverrides.adapterConfig),
+    };
+    return readNonEmptyString(effectiveConfig.model);
   }
 
   async function listActiveBlocks(companyId: string) {
@@ -658,6 +730,96 @@ export function providerRateLimitService(db: Db) {
     return wakeup!.id;
   }
 
+  async function queueProviderScopeChangedWakeup(input: {
+    block: BlockRow;
+    agent: typeof agents.$inferSelect;
+    issueId: string;
+    now: Date;
+  }) {
+    const idempotencyKey = `provider_rate_limit_scope_changed:${input.block.id}:${input.issueId}:${input.agent.id}`;
+    const existing = await db
+      .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.block.companyId),
+          eq(agentWakeupRequests.agentId, input.agent.id),
+          eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (existing) return { queued: false, wakeupRequestId: existing.id, runId: existing.runId, reason: "duplicate" };
+
+    const wakeupRequest = await db
+      .insert(agentWakeupRequests)
+      .values({
+        companyId: input.block.companyId,
+        agentId: input.agent.id,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "provider_rate_limit_scope_changed",
+        payload: {
+          blockId: input.block.id,
+          adapterType: input.block.adapterType,
+          limitKind: input.block.limitKind,
+          modelFamily: input.block.modelFamily,
+          issueId: input.issueId,
+        },
+        status: "queued",
+        requestedByActorType: "system",
+        requestedByActorId: "provider_rate_limit_service",
+        idempotencyKey,
+        requestedAt: input.now,
+        updatedAt: input.now,
+      })
+      .returning()
+      .then((rows) => rows[0]);
+
+    const run = await db
+      .insert(heartbeatRuns)
+      .values({
+        companyId: input.block.companyId,
+        agentId: input.agent.id,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: wakeupRequest.id,
+        contextSnapshot: {
+          source: "provider_rate_limit_scope_changed",
+          reason: "provider_rate_limit_scope_changed",
+          wakeReason: "provider_rate_limit_scope_changed",
+          blockId: input.block.id,
+          adapterType: input.block.adapterType,
+          limitKind: input.block.limitKind,
+          modelFamily: input.block.modelFamily,
+          issueId: input.issueId,
+        },
+        updatedAt: input.now,
+      })
+      .returning()
+      .then((rows) => rows[0]);
+
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: run.id, updatedAt: input.now })
+      .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+    await writeActivity({
+      companyId: input.block.companyId,
+      action: "provider_rate_limit.scope_changed_wakeup_queued",
+      entityId: input.block.id,
+      agentId: input.agent.id,
+      runId: run.id,
+      details: {
+        issueId: input.issueId,
+        wakeupRequestId: wakeupRequest.id,
+        idempotencyKey,
+      },
+    });
+
+    return { queued: true, wakeupRequestId: wakeupRequest.id, runId: run.id, reason: "queued" };
+  }
+
   async function memberRowsForRelease(block: BlockRow) {
     const members = await db
       .select()
@@ -1000,6 +1162,163 @@ export function providerRateLimitService(db: Db) {
     return { affectedAgents: agentIds.length, resumed, wakeupsQueued, wakeupsSkipped };
   }
 
+  async function reconcileAgentProviderLimitPause(agentId: string) {
+    const agent = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    if (!agent || agent.status !== "paused" || agent.pauseReason !== "provider_rate_limit") {
+      return { released: false, issueIds: [] as string[], wakeupsQueued: 0, wakeupsSkipped: 0 };
+    }
+
+    const activeMembers = await db
+      .select({
+        member: providerRateLimitBlockMembers,
+        block: providerRateLimitBlocks,
+      })
+      .from(providerRateLimitBlockMembers)
+      .innerJoin(providerRateLimitBlocks, eq(providerRateLimitBlockMembers.blockId, providerRateLimitBlocks.id))
+      .where(
+        and(
+          eq(providerRateLimitBlockMembers.companyId, agent.companyId),
+          eq(providerRateLimitBlockMembers.agentId, agent.id),
+          isNull(providerRateLimitBlocks.resolvedAt),
+        ),
+      );
+
+    const scopesToCheck = activeMembers.length > 0
+      ? activeMembers.map((row) => row.member.issueId ?? null)
+      : [null];
+    for (const issueId of scopesToCheck) {
+      const model = await resolveEffectiveRunModel({
+        companyId: agent.companyId,
+        agent,
+        issueId,
+      });
+      const matchingBlock = await getActiveBlockForAgent(agent.companyId, agent.adapterType, model);
+      if (matchingBlock) {
+        return { released: false, issueIds: [] as string[], wakeupsQueued: 0, wakeupsSkipped: 0 };
+      }
+    }
+
+    const now = new Date();
+    const [releasedAgent] = await db
+      .update(agents)
+      .set({ status: "idle", pauseReason: null, pausedAt: null, updatedAt: now })
+      .where(
+        and(
+          eq(agents.id, agent.id),
+          eq(agents.companyId, agent.companyId),
+          eq(agents.status, "paused"),
+          eq(agents.pauseReason, "provider_rate_limit"),
+        ),
+      )
+      .returning();
+    if (!releasedAgent) {
+      return { released: false, issueIds: [] as string[], wakeupsQueued: 0, wakeupsSkipped: 0 };
+    }
+
+    const memberIssueIds = [...new Set(activeMembers.map((row) => row.member.issueId).filter(Boolean) as string[])];
+    const wakeableIssues = memberIssueIds.length > 0
+      ? await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, agent.companyId),
+            eq(issues.assigneeAgentId, agent.id),
+            eq(issues.status, "blocked"),
+            inArray(issues.id, memberIssueIds),
+            sql`not exists (
+              select 1
+              from ${issueRelations}
+              join ${issues} as blocker_issues
+                on blocker_issues.id = ${issueRelations.issueId}
+              where ${issueRelations.companyId} = ${agent.companyId}
+                and ${issueRelations.type} = 'blocks'
+                and ${issueRelations.relatedIssueId} = ${issues.id}
+                and blocker_issues.status <> 'done'
+            )`,
+          ),
+        )
+      : [];
+    const issueIds = wakeableIssues.map((issue) => issue.id);
+
+    if (issueIds.length > 0) {
+      await db
+        .update(issues)
+        .set({ status: "in_progress", updatedAt: now })
+        .where(
+          and(
+            eq(issues.companyId, agent.companyId),
+            eq(issues.assigneeAgentId, agent.id),
+            eq(issues.status, "blocked"),
+            inArray(issues.id, issueIds),
+          ),
+        );
+    }
+
+    let wakeupsQueued = 0;
+    let wakeupsSkipped = 0;
+    const firstMemberByIssueId = new Map<string, { member: typeof providerRateLimitBlockMembers.$inferSelect; block: BlockRow }>();
+    for (const row of activeMembers) {
+      if (row.member.issueId && !firstMemberByIssueId.has(row.member.issueId)) {
+        firstMemberByIssueId.set(row.member.issueId, row);
+      }
+    }
+    for (const issueId of issueIds) {
+      const row = firstMemberByIssueId.get(issueId);
+      if (!row) continue;
+      const wakeup = await queueProviderScopeChangedWakeup({
+        block: row.block,
+        agent: releasedAgent,
+        issueId,
+        now,
+      });
+      if (wakeup.queued) wakeupsQueued += 1;
+      else wakeupsSkipped += 1;
+      await db
+        .update(providerRateLimitBlockMembers)
+        .set({
+          releaseStatus: "scope_changed",
+          releaseReason: "agent_scope_no_longer_matches_active_block",
+          wakeupRequestId: wakeup.wakeupRequestId,
+          updatedAt: now,
+        })
+        .where(eq(providerRateLimitBlockMembers.id, row.member.id));
+    }
+
+    const memberIds = activeMembers.map((row) => row.member.id);
+    if (memberIds.length > 0) {
+      await db
+        .update(providerRateLimitBlockMembers)
+        .set({
+          releaseStatus: "scope_changed",
+          releaseReason: "agent_scope_no_longer_matches_active_block",
+          updatedAt: now,
+        })
+        .where(inArray(providerRateLimitBlockMembers.id, memberIds));
+    }
+
+    for (const block of new Map(activeMembers.map((row) => [row.block.id, row.block])).values()) {
+      await writeActivity({
+        companyId: block.companyId,
+        action: "provider_rate_limit.agent_scope_reconciled",
+        entityId: block.id,
+        agentId: agent.id,
+        details: {
+          adapterType: agent.adapterType,
+          issueIds,
+          wakeupsQueued,
+          wakeupsSkipped,
+        },
+      });
+    }
+
+    return { released: true, issueIds, wakeupsQueued, wakeupsSkipped };
+  }
+
   async function deriveBlockScope(
     adapterType: string,
     rateLimitBlock: { limitKind: string; modelFamily: string | null; resetsAt: string | null },
@@ -1037,6 +1356,7 @@ export function providerRateLimitService(db: Db) {
     upsertBlock,
     getBlock,
     getActiveBlockForAgent,
+    resolveEffectiveRunModel,
     listActiveBlocks,
     listResetDueActiveBlocks,
     resolveBlock,
@@ -1046,6 +1366,7 @@ export function providerRateLimitService(db: Db) {
     resumeAgentsForBlock,
     isWindowStillBlocked,
     releaseAndResumeForBlock,
+    reconcileAgentProviderLimitPause,
     deriveBlockScope,
   };
 }
