@@ -63,6 +63,47 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     await tempDb?.cleanup();
   });
 
+  it("coalesces concurrent provider block upserts for the same active window", async () => {
+    const svc = providerRateLimitService(db);
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const resetsAt = new Date("2026-05-06T10:00:00.000Z");
+    const [first, second] = await Promise.all([
+      svc.upsertBlock({
+        companyId,
+        adapterType: "claude_local",
+        limitKind: "five_hour",
+        modelFamily: null,
+        message: "first limit hit",
+        resetsAt,
+      }),
+      svc.upsertBlock({
+        companyId,
+        adapterType: "claude_local",
+        limitKind: "five_hour",
+        modelFamily: null,
+        message: "second limit hit",
+        resetsAt,
+      }),
+    ]);
+
+    expect(first.id).toBe(second.id);
+
+    const blocks = await db
+      .select()
+      .from(providerRateLimitBlocks)
+      .where(eq(providerRateLimitBlocks.companyId, companyId));
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]?.hitCount).toBe(2);
+  });
+
   async function seedPausedClaudeAgentWithDueBlock(input?: {
     now?: Date;
     usedPercent?: number;

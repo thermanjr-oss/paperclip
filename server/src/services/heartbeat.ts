@@ -5787,6 +5787,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const policy = parseHeartbeatPolicy(agent);
     return db.transaction(async (tx) => {
+      await tx.execute(sql`
+        select pg_advisory_xact_lock(hashtextextended(${`heartbeat-run-claim:${run.agentId}`}, 0))
+      `);
+
       const [{ count }] = await tx
         .select({ count: sql<number>`count(*)::int` })
         .from(heartbeatRuns)

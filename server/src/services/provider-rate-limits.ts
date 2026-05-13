@@ -117,70 +117,88 @@ export function providerRateLimitService(db: Db) {
     runId?: string | null;
   }) {
     const now = new Date();
-    const scopeFilter = and(
-      eq(providerRateLimitBlocks.companyId, input.companyId),
-      eq(providerRateLimitBlocks.adapterType, input.adapterType),
-      eq(providerRateLimitBlocks.limitKind, input.limitKind),
-      input.modelFamily
-        ? eq(providerRateLimitBlocks.modelFamily, input.modelFamily)
-        : isNull(providerRateLimitBlocks.modelFamily),
-      isNull(providerRateLimitBlocks.resolvedAt),
-    );
+    const blockScopeKey = [
+      "provider-rate-limit-block",
+      input.companyId,
+      input.adapterType,
+      input.limitKind,
+      input.modelFamily ?? "",
+    ].join(":");
 
-    const existing = await db
-      .select()
-      .from(providerRateLimitBlocks)
-      .where(scopeFilter)
-      .then((rows) => rows[0] ?? null);
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${blockScopeKey}, 0))`);
 
-    if (existing) {
-      const [updated] = await db
-        .update(providerRateLimitBlocks)
-        .set({
-          hitCount: sql`${providerRateLimitBlocks.hitCount} + 1`,
+      const scopeFilter = and(
+        eq(providerRateLimitBlocks.companyId, input.companyId),
+        eq(providerRateLimitBlocks.adapterType, input.adapterType),
+        eq(providerRateLimitBlocks.limitKind, input.limitKind),
+        input.modelFamily
+          ? eq(providerRateLimitBlocks.modelFamily, input.modelFamily)
+          : isNull(providerRateLimitBlocks.modelFamily),
+        isNull(providerRateLimitBlocks.resolvedAt),
+      );
+
+      const existing = await tx
+        .select()
+        .from(providerRateLimitBlocks)
+        .where(scopeFilter)
+        .then((rows) => rows[0] ?? null);
+
+      if (existing) {
+        const [updated] = await tx
+          .update(providerRateLimitBlocks)
+          .set({
+            hitCount: sql`${providerRateLimitBlocks.hitCount} + 1`,
+            lastSeenAt: now,
+            message: input.message ?? existing.message,
+            resetsAt: input.resetsAt ?? existing.resetsAt,
+            updatedAt: now,
+          })
+          .where(eq(providerRateLimitBlocks.id, existing.id))
+          .returning();
+        return { action: "coalesced" as const, block: updated ?? existing, existing };
+      }
+
+      const [block] = await tx
+        .insert(providerRateLimitBlocks)
+        .values({
+          companyId: input.companyId,
+          adapterType: input.adapterType,
+          limitKind: input.limitKind,
+          modelFamily: input.modelFamily,
+          message: input.message,
+          resetsAt: input.resetsAt,
+          hitCount: 1,
           lastSeenAt: now,
-          message: input.message ?? existing.message,
-          resetsAt: input.resetsAt ?? existing.resetsAt,
           updatedAt: now,
         })
-        .where(eq(providerRateLimitBlocks.id, existing.id))
         .returning();
+      return { action: "created" as const, block: block!, existing: null };
+    });
+
+    if (result.action === "coalesced") {
       await writeActivity({
         companyId: input.companyId,
         action: "provider_rate_limit.hit_coalesced",
-        entityId: existing.id,
+        entityId: result.block.id,
         agentId: input.agentId ?? null,
         runId: input.runId ?? null,
         details: {
           adapterType: input.adapterType,
           limitKind: input.limitKind,
           modelFamily: input.modelFamily,
-          hitCount: updated?.hitCount ?? existing.hitCount + 1,
-          resetsAt: isoOrNull(input.resetsAt ?? existing.resetsAt),
+          hitCount: result.block.hitCount,
+          resetsAt: isoOrNull(result.block.resetsAt),
           lastSeenAt: now.toISOString(),
         },
       });
-      return updated ?? existing;
+      return result.block;
     }
 
-    const [block] = await db
-      .insert(providerRateLimitBlocks)
-      .values({
-        companyId: input.companyId,
-        adapterType: input.adapterType,
-        limitKind: input.limitKind,
-        modelFamily: input.modelFamily,
-        message: input.message,
-        resetsAt: input.resetsAt,
-        hitCount: 1,
-        lastSeenAt: now,
-        updatedAt: now,
-      })
-      .returning();
     await writeActivity({
       companyId: input.companyId,
       action: "provider_rate_limit.block_created",
-      entityId: block!.id,
+      entityId: result.block.id,
       agentId: input.agentId ?? null,
       runId: input.runId ?? null,
       details: {
@@ -191,7 +209,7 @@ export function providerRateLimitService(db: Db) {
         lastSeenAt: now.toISOString(),
       },
     });
-    return block!;
+    return result.block;
   }
 
   async function getActiveBlockForAgent(
