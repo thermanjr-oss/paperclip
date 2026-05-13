@@ -323,9 +323,19 @@ export function providerRateLimitService(db: Db) {
   async function releaseDueBlocks(now: Date, resolvedBy = "system") {
     const resetDueBlocks = await listResetDueActiveBlocks(now);
     let released = 0;
+    let stillBlocked = 0;
     let wakeupsQueued = 0;
     let wakeupsSkipped = 0;
     for (const block of resetDueBlocks) {
+      const windowStillBlocked = await isWindowStillBlocked(block.adapterType, block.limitKind, {
+        resetsAt: block.resetsAt,
+        now,
+      });
+      if (windowStillBlocked) {
+        stillBlocked += 1;
+        continue;
+      }
+
       const resolvedBlock = await resolveBlock(block.id, resolvedBy);
       if (!resolvedBlock) continue;
       const result = await releaseAndResumeForBlock(resolvedBlock);
@@ -333,7 +343,7 @@ export function providerRateLimitService(db: Db) {
       wakeupsQueued += result.wakeupsQueued;
       wakeupsSkipped += result.wakeupsSkipped;
     }
-    return { checked: resetDueBlocks.length, released, wakeupsQueued, wakeupsSkipped };
+    return { checked: resetDueBlocks.length, released, stillBlocked, wakeupsQueued, wakeupsSkipped };
   }
 
   async function recoverLegacyResolvedBlocks(now = new Date()) {
@@ -566,14 +576,20 @@ export function providerRateLimitService(db: Db) {
       .then((rows) => rows.map((row) => row.id));
   }
 
-  async function isWindowStillBlocked(adapterType: string, limitKind: string): Promise<boolean> {
+  async function isWindowStillBlocked(
+    adapterType: string,
+    limitKind: string,
+    opts?: { resetsAt?: Date | null; now?: Date },
+  ): Promise<boolean> {
+    const now = opts?.now ?? new Date();
+    const resetIsFuture = opts?.resetsAt ? opts.resetsAt.getTime() > now.getTime() : false;
     try {
       const results = await fetchAllQuotaWindows();
       const providerSlug = providerSlugForAdapterType(adapterType);
       const providerResult = results.find((r) => r.provider === providerSlug);
       if (!providerResult?.ok) return true; // Cannot verify → assume still blocked
       const window = providerResult.windows.find((w) => w.windowId === limitKind);
-      if (!window) return false; // Window no longer reported → assume released
+      if (!window) return resetIsFuture; // Future provider reset remains authoritative when the quota API omits the window.
       if ((window.usedPercent ?? 0) < 100) return false;
       return !providerHasUsablePaidOverflow(providerResult);
     } catch {

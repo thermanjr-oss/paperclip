@@ -138,7 +138,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     return { companyId, agentId, blockId, now };
   }
 
-  it("resolves a reset-due block even when provider quota still appears exhausted", async () => {
+  it("keeps a reset-due block active when provider quota still appears exhausted", async () => {
     const { companyId, agentId, blockId, now } = await seedPausedClaudeAgentWithDueBlock({
       usedPercent: 100,
     });
@@ -149,25 +149,17 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
       .select()
       .from(providerRateLimitBlocks)
       .where(eq(providerRateLimitBlocks.id, blockId));
-    expect(block?.resolvedAt).toBeInstanceOf(Date);
+    expect(block?.resolvedAt).toBeNull();
 
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
-    expect(agent?.status).toBe("idle");
-    expect(agent?.pauseReason).toBeNull();
+    expect(agent?.status).toBe("paused");
+    expect(agent?.pauseReason).toBe("provider_rate_limit");
 
     const resetWakeups = await db
       .select()
       .from(agentWakeupRequests)
       .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.reason, "provider_rate_limit_reset")));
-    expect(resetWakeups).toHaveLength(1);
-    expect(resetWakeups[0]?.idempotencyKey).toBe(`provider_rate_limit_reset:${blockId}:${agentId}`);
-
-    const resetRuns = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.wakeupRequestId, resetWakeups[0]!.id));
-    expect(resetRuns).toHaveLength(1);
-    expect(resetRuns[0]?.status).toBe("scheduled_retry");
+    expect(resetWakeups).toHaveLength(0);
 
     const activeBlocks = await db
       .select()
@@ -178,7 +170,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
           isNull(providerRateLimitBlocks.resolvedAt),
         ),
       );
-    expect(activeBlocks).toHaveLength(0);
+    expect(activeBlocks).toHaveLength(1);
   });
 
   it("queues one provider reset wakeup for the current issue assignee", async () => {
@@ -481,7 +473,7 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
     expect(agent?.pauseReason).toBeNull();
   });
 
-  it("resolves a reset-due Claude block even when extra usage is disabled", async () => {
+  it("keeps a reset-due Claude block active when extra usage is disabled and quota is exhausted", async () => {
     const { agentId, blockId, now } = await seedPausedClaudeAgentWithDueBlock({
       limitKind: "seven_day",
       usedPercent: 100,
@@ -503,11 +495,11 @@ describeEmbeddedPostgres("provider rate-limit blocks", () => {
       .select()
       .from(providerRateLimitBlocks)
       .where(eq(providerRateLimitBlocks.id, blockId));
-    expect(block?.resolvedAt).toBeInstanceOf(Date);
+    expect(block?.resolvedAt).toBeNull();
 
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
-    expect(agent?.status).toBe("idle");
-    expect(agent?.pauseReason).toBeNull();
+    expect(agent?.status).toBe("paused");
+    expect(agent?.pauseReason).toBe("provider_rate_limit");
   });
 
   it("resolves a Codex weekly block when paid credits remain", async () => {
