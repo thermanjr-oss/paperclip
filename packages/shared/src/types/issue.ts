@@ -304,6 +304,7 @@ export type IssueRetryNowOutcome =
   | "promoted"
   | "already_promoted"
   | "no_scheduled_retry"
+  | "deferred"
   | "gate_suppressed";
 
 export interface IssueRetryNowResponse {
