@@ -1776,8 +1776,9 @@ function PromptsTab({
   const selectedFileExists = bundleMatchesDraft && fileOptions.includes(selectedOrEntryFile);
   const selectedFileSummary = bundle?.files.find((file) => file.path === selectedOrEntryFile) ?? null;
 
-  const { data: selectedFileDetail, isLoading: fileLoading } = useQuery({
-    queryKey: queryKeys.agents.instructionsFile(agent.id, selectedOrEntryFile),
+  const bundleRootPath = bundle?.rootPath ?? "";
+  const { data: selectedFileDetail, isLoading: fileLoading, error: fileError } = useQuery({
+    queryKey: queryKeys.agents.instructionsFile(agent.id, selectedOrEntryFile, bundleRootPath),
     queryFn: () => agentsApi.instructionsFile(agent.id, selectedOrEntryFile, companyId),
     enabled: Boolean(companyId && isLocal && selectedFileExists),
   });
@@ -1805,7 +1806,7 @@ function PromptsTab({
     onSuccess: (_, variables) => {
       setPendingFiles((prev) => prev.filter((f) => f !== variables.path));
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.instructionsBundle(agent.id) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.agents.instructionsFile(agent.id, variables.path) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.instructionsFile(agent.id, variables.path, bundleRootPath) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
     },
@@ -1817,7 +1818,7 @@ function PromptsTab({
     onMutate: () => setAwaitingRefresh(true),
     onSuccess: (_, relativePath) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.instructionsBundle(agent.id) });
-      queryClient.removeQueries({ queryKey: queryKeys.agents.instructionsFile(agent.id, relativePath) });
+      queryClient.removeQueries({ queryKey: queryKeys.agents.instructionsFile(agent.id, relativePath, bundleRootPath) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
     },
@@ -2391,6 +2392,12 @@ function PromptsTab({
 
           {selectedFileExists && fileLoading && !selectedFileDetail ? (
             <PromptEditorSkeleton />
+          ) : selectedFileExists && fileError && !selectedFileDetail ? (
+            <div className="flex min-h-[420px] items-center justify-center rounded-md border border-border">
+              <p className="text-sm text-destructive">
+                Failed to load file: {fileError instanceof Error ? fileError.message : "Unknown error"}
+              </p>
+            </div>
           ) : isMarkdown(selectedOrEntryFile) ? (
             <MarkdownEditor
               key={selectedOrEntryFile}
