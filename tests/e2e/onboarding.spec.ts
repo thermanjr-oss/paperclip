@@ -16,7 +16,10 @@ import { test, expect } from "@playwright/test";
 
 const SKIP_LLM = process.env.PAPERCLIP_E2E_SKIP_LLM !== "false";
 
-const COMPANY_NAME = `E2E-Test-${Date.now()}`;
+// The default Playwright config creates a fresh PAPERCLIP_HOME per run, so
+// fixed fixtures are safe and assert DEV-136's explicit Trading/TRD path.
+const COMPANY_NAME = "Trading";
+const COMPANY_PREFIX = "TRD";
 const AGENT_NAME = "CEO";
 const TASK_TITLE = "E2E test task";
 
@@ -30,6 +33,10 @@ test.describe("Onboarding wizard", () => {
 
     const companyNameInput = page.locator('input[placeholder="Acme Corp"]');
     await companyNameInput.fill(COMPANY_NAME);
+    const companyPrefixInput = page.getByLabel("Issue prefix");
+    await expect(companyPrefixInput).toHaveValue("TRA");
+    await companyPrefixInput.fill(COMPANY_PREFIX);
+    await expect(companyPrefixInput).toHaveValue(COMPANY_PREFIX);
 
     const nextButton = page.getByRole("button", { name: "Next" });
     await nextButton.click();
@@ -120,6 +127,7 @@ test.describe("Onboarding wizard", () => {
       (c: { name: string }) => c.name === COMPANY_NAME
     );
     expect(company).toBeTruthy();
+    expect(company.issuePrefix).toBe(COMPANY_PREFIX);
 
     const agentsRes = await page.request.get(
       `${baseUrl}/api/companies/${company.id}/agents`
@@ -151,6 +159,7 @@ test.describe("Onboarding wizard", () => {
       (i: { title: string }) => i.title === TASK_TITLE
     );
     expect(task).toBeTruthy();
+    expect(task.identifier).toMatch(new RegExp(`^${COMPANY_PREFIX}-`));
     expect(task.assigneeAgentId).toBe(ceoAgent.id);
     expect(task.description).toContain(
       "You are the CEO. You set the direction for the company."
