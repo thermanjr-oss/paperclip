@@ -212,7 +212,7 @@ export function deriveIssueCommentRunLogAttribution(
 export interface IssueFilters {
   attention?: "blocked";
   status?: string;
-  assigneeAgentId?: string;
+  assigneeAgentId?: string | null;
   participantAgentId?: string;
   assigneeUserId?: string;
   touchedByUserId?: string;
@@ -3435,7 +3435,9 @@ export function issueService(db: Db) {
         const statuses = filters.status.split(",").map((s) => s.trim());
         conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]) : inArray(issues.status, statuses));
       }
-      if (filters?.assigneeAgentId) {
+      if (filters?.assigneeAgentId === null) {
+        conditions.push(isNull(issues.assigneeAgentId));
+      } else if (filters?.assigneeAgentId) {
         conditions.push(eq(issues.assigneeAgentId, filters.assigneeAgentId));
       }
       if (filters?.participantAgentId) {
@@ -3875,6 +3877,7 @@ export function issueService(db: Db) {
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
           companyId: issues.companyId,
+          executionPolicy: issues.executionPolicy,
         })
         .from(issues)
         .where(eq(issues.id, parentIssueId))
@@ -3930,6 +3933,7 @@ export function issueService(db: Db) {
       return {
         id: parent.id,
         assigneeAgentId: parent.assigneeAgentId,
+        executionPolicy: parent.executionPolicy,
         childIssueIds: children.map((child) => child.id),
         childIssueSummaries,
         childIssueSummaryTruncated: children.length > childIssueSummaries.length,
