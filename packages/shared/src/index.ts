@@ -693,6 +693,10 @@ export {
   issueGraphLivenessAutoRecoveryRequestSchema,
   type PatchInstanceExperimentalSettings,
   type IssueGraphLivenessAutoRecoveryRequest,
+  instanceBackupSettingsSchema,
+  patchInstanceBackupSettingsSchema,
+  type InstanceBackupSettings,
+  type PatchInstanceBackupSettings,
 } from "./validators/index.js";
 
 export {
@@ -812,6 +816,7 @@ export {
   respondIssueThreadInteractionSchema,
   linkIssueApprovalSchema,
   createIssueAttachmentMetadataSchema,
+  createIssueRelationSchema,
   createIssueWorkProductSchema,
   updateIssueWorkProductSchema,
   issueWorkProductTypeSchema,
@@ -848,6 +853,7 @@ export {
   type RespondIssueThreadInteraction,
   type LinkIssueApproval,
   type CreateIssueAttachmentMetadata,
+  type CreateIssueRelation,
   type CreateIssueWorkProduct,
   type UpdateIssueWorkProduct,
   type UpdateExecutionWorkspace,
