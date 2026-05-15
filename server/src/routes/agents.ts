@@ -99,6 +99,7 @@ import {
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { resolveAdapterModelAvailability } from "../services/adapter-model-compat.js";
 
 const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
@@ -1047,12 +1048,25 @@ export function agentRoutes(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
   ) {
-    if (adapterType !== "opencode_local") return;
-    try {
-      requireOpenCodeModelId(adapterConfig.model);
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      throw unprocessable(`Invalid opencode_local adapterConfig: ${reason}`);
+    if (adapterType === "opencode_local") {
+      try {
+        requireOpenCodeModelId(adapterConfig.model);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw unprocessable(`Invalid opencode_local adapterConfig: ${reason}`);
+      }
+    }
+
+    if (adapterType) {
+      const model = typeof adapterConfig.model === "string" ? adapterConfig.model.trim() : "";
+      if (model) {
+        const compat = resolveAdapterModelAvailability(adapterType, model, "");
+        if (!compat.available) {
+          throw unprocessable(
+            `Model "${model}" is not available for this account at field adapterConfig.model. Supported: ${compat.supportedModels.join(", ")}.`,
+          );
+        }
+      }
     }
   }
 
@@ -1810,6 +1824,49 @@ export function agentRoutes(
       return;
     }
     res.json(await buildAgentDetail(agent));
+  });
+
+  router.post("/agents/:id/preflight", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+
+    const adapterType = typeof agent.adapterType === "string" ? agent.adapterType.trim() : "";
+    const adapterConfig = asRecord(agent.adapterConfig) ?? {};
+    const model = typeof adapterConfig.model === "string" ? adapterConfig.model.trim() : "";
+
+    if (!adapterType) {
+      res.status(200).json({
+        ok: false,
+        agentId: agent.id,
+        identifier: { name: agent.name, urlKey: agent.urlKey },
+        adapterType: null,
+        model: model || null,
+        check: {
+          available: false,
+          code: "adapter_unknown",
+          reason: "Agent has no adapterType configured.",
+          supportedModels: [],
+        },
+        mode: "shape_only",
+      });
+      return;
+    }
+
+    const check = resolveAdapterModelAvailability(adapterType, model, agent.companyId);
+    res.status(200).json({
+      ok: check.available,
+      agentId: agent.id,
+      identifier: { name: agent.name, urlKey: agent.urlKey },
+      adapterType,
+      model: model || null,
+      check,
+      mode: "shape_only",
+    });
   });
 
   router.get("/agents/:id/configuration", async (req, res) => {
