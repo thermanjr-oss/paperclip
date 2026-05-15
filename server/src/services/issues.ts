@@ -287,6 +287,11 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+// CLI-165: shared alias used by helpers that accept either the root db or a transaction from
+// db.transaction(). Using `Db | Tx` preserves Drizzle's query-builder types at both call sites
+// (inline root query and inside a transaction), which is especially important for the drain
+// chokepoint where losing type safety could mask a wrong-table reference.
+type DbOrTx = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -779,7 +784,7 @@ function latestIssueActivityAt(...values: Array<Date | string | null | undefined
   return normalized[0] ?? null;
 }
 
-async function labelMapForIssues(dbOrTx: any, issueIds: string[]): Promise<Map<string, IssueLabelRow[]>> {
+async function labelMapForIssues(dbOrTx: DbOrTx, issueIds: string[]): Promise<Map<string, IssueLabelRow[]>> {
   const map = new Map<string, IssueLabelRow[]>();
   if (issueIds.length === 0) return map;
   for (const issueIdChunk of chunkList(issueIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
@@ -802,7 +807,7 @@ async function labelMapForIssues(dbOrTx: any, issueIds: string[]): Promise<Map<s
   return map;
 }
 
-async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWithLabels[]> {
+async function withIssueLabels(dbOrTx: DbOrTx, rows: IssueRow[]): Promise<IssueWithLabels[]> {
   if (rows.length === 0) return [];
   const labelsByIssueId = await labelMapForIssues(dbOrTx, rows.map((row) => row.id));
   return rows.map((row) => {
@@ -873,7 +878,7 @@ type IssueBlockerAttentionAgentRow = {
 };
 
 async function activeRunMapForIssues(
-  dbOrTx: any,
+  dbOrTx: DbOrTx,
   issueRows: IssueWithLabels[],
 ): Promise<Map<string, IssueActiveRunRow>> {
   const map = new Map<string, IssueActiveRunRow>();
@@ -1153,7 +1158,7 @@ async function listIssueProductivityReviewMap(
 }
 
 async function listIssueBlockerAttentionMap(
-  dbOrTx: any,
+  dbOrTx: DbOrTx,
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
 ): Promise<Map<string, IssueBlockerAttention>> {
@@ -1604,7 +1609,7 @@ function withActiveRuns(
 }
 
 async function userCommentStatsForIssues(
-  dbOrTx: any,
+  dbOrTx: DbOrTx,
   companyId: string,
   userId: string,
   issueIds: string[],
@@ -1640,7 +1645,7 @@ async function userCommentStatsForIssues(
 }
 
 async function userReadStatsForIssues(
-  dbOrTx: any,
+  dbOrTx: DbOrTx,
   companyId: string,
   userId: string,
   issueIds: string[],
@@ -1666,7 +1671,7 @@ async function userReadStatsForIssues(
 }
 
 async function lastActivityStatsForIssues(
-  dbOrTx: any,
+  dbOrTx: DbOrTx,
   companyId: string,
   issueIds: string[],
 ): Promise<IssueLastActivityStat[]> {
@@ -3052,7 +3057,7 @@ export function issueService(db: Db) {
     }
   }
 
-  async function assertValidLabelIds(companyId: string, labelIds: string[], dbOrTx: any = db) {
+  async function assertValidLabelIds(companyId: string, labelIds: string[], dbOrTx: DbOrTx = db) {
     if (labelIds.length === 0) return;
     const existing = await dbOrTx
       .select({ id: labels.id })
@@ -3067,7 +3072,7 @@ export function issueService(db: Db) {
     issueId: string,
     companyId: string,
     labelIds: string[],
-    dbOrTx: any = db,
+    dbOrTx: DbOrTx = db,
   ) {
     const deduped = [...new Set(labelIds)];
     await assertValidLabelIds(companyId, deduped, dbOrTx);
@@ -3207,7 +3212,7 @@ export function issueService(db: Db) {
     companyId: string,
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
-    dbOrTx: any = db,
+    dbOrTx: DbOrTx = db,
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
@@ -3249,7 +3254,7 @@ export function issueService(db: Db) {
         companyId,
         issueId: blockerIssueId,
         relatedIssueId: issueId,
-        type: "blocks",
+        type: "blocks" as const,
         createdByAgentId: actor.agentId ?? null,
         createdByUserId: actor.userId ?? null,
       })),
@@ -3359,6 +3364,10 @@ export function issueService(db: Db) {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
+
+      // Queued and running execution runs are live handoffs. Stalled queued runs
+      // are reconciled by the heartbeat stale-run watchdog; this write-path drain
+      // only clears terminal or missing locks so it cannot orphan valid work.
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
 
       const updated = await tx
@@ -3783,7 +3792,7 @@ export function issueService(db: Db) {
       return relations.get(issueId) ?? { blockedBy: [], blocks: [] };
     },
 
-    getDependencyReadiness: async (issueId: string, dbOrTx: any = db) => {
+    getDependencyReadiness: async (issueId: string, dbOrTx: DbOrTx = db) => {
       const issue = await dbOrTx
         .select({ id: issues.id, companyId: issues.companyId })
         .from(issues)
@@ -3794,14 +3803,14 @@ export function issueService(db: Db) {
       return readiness.get(issueId) ?? createIssueDependencyReadiness(issueId);
     },
 
-    listDependencyReadiness: async (companyId: string, issueIds: string[], dbOrTx: any = db) => {
+    listDependencyReadiness: async (companyId: string, issueIds: string[], dbOrTx: DbOrTx = db) => {
       return listIssueDependencyReadinessMap(dbOrTx, companyId, issueIds);
     },
 
     listBlockerAttention: async (
       companyId: string,
       issueRows: IssueBlockerAttentionInputNode[],
-      dbOrTx: any = db,
+      dbOrTx: DbOrTx = db,
     ) => {
       return listIssueBlockerAttentionMap(dbOrTx, companyId, issueRows);
     },
@@ -4247,7 +4256,7 @@ export function issueService(db: Db) {
         actorAgentId?: string | null;
         actorUserId?: string | null;
       },
-      dbOrTx: any = db,
+      dbOrTx: DbOrTx = db,
     ) => {
       const existing = await dbOrTx
         .select()
