@@ -16,17 +16,28 @@ export async function scanCompany(ctx: PluginContext, companyId: string, now: Da
   return stalled.sort((a, b) => b.daysStalled - a.daysStalled || a.issueId.localeCompare(b.issueId));
 }
 
+export type StalledSnapshot = { scannedAt: string | null; stalled: StalledIssue[] };
+
+const stalledKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, stateKey: STALLED_STATE_KEY });
+
+export async function readStalled(ctx: PluginContext, companyId: string): Promise<StalledSnapshot> {
+  const stored = (await ctx.state.get(stalledKey(companyId))) as StalledSnapshot | null;
+  return stored ?? { scannedAt: null, stalled: [] };
+}
+
+export async function scanAndStoreCompany(ctx: PluginContext, companyId: string, now: Date): Promise<StalledSnapshot> {
+  const snapshot = { scannedAt: now.toISOString(), stalled: await scanCompany(ctx, companyId, now) };
+  await ctx.state.set(stalledKey(companyId), snapshot);
+  return snapshot;
+}
+
 export async function scanAllCompanies(ctx: PluginContext, now: Date): Promise<number> {
   let total = 0;
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const companies = await ctx.companies.list({ limit: PAGE_SIZE, offset });
     for (const company of companies) {
-      const stalled = await scanCompany(ctx, company.id, now);
-      await ctx.state.set(
-        { scopeKind: "company", scopeId: company.id, stateKey: STALLED_STATE_KEY },
-        { scannedAt: now.toISOString(), stalled },
-      );
-      total += stalled.length;
+      const snapshot = await scanAndStoreCompany(ctx, company.id, now);
+      total += snapshot.stalled.length;
     }
     if (companies.length < PAGE_SIZE) break;
   }

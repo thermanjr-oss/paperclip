@@ -1,5 +1,11 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import { SCAN_JOB_KEY, scanAllCompanies } from "./scan.js";
+import { SCAN_JOB_KEY, readStalled, scanAllCompanies, scanAndStoreCompany } from "./scan.js";
+
+function requireCompanyId(params: Record<string, unknown>): string {
+  const companyId = params.companyId;
+  if (typeof companyId !== "string" || companyId.length === 0) throw new Error("companyId is required");
+  return companyId;
+}
 
 const plugin = definePlugin({
   async setup(ctx) {
@@ -8,14 +14,9 @@ const plugin = definePlugin({
       ctx.logger.info("Finish Line scan complete", { runId: job.runId, stalled: total });
     });
 
-    ctx.data.register("health", async () => {
-      return { status: "ok", checkedAt: new Date().toISOString() };
-    });
+    ctx.data.register("stalled", async (params) => readStalled(ctx, requireCompanyId(params)));
 
-    ctx.actions.register("ping", async () => {
-      ctx.logger.info("Ping action invoked");
-      return { pong: true, at: new Date().toISOString() };
-    });
+    ctx.actions.register("scan-now", async (params) => scanAndStoreCompany(ctx, requireCompanyId(params), new Date()));
   },
 
   async onHealth() {

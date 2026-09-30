@@ -58,12 +58,48 @@ describe("finish line plugin", () => {
     expect(state.stalled.map((row) => row.issueId)).toEqual(["i2"]);
   });
 
-  it("keeps the health data and ping action", async () => {
+  it("stalled data is empty before any scan", async () => {
     const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
-    const data = await harness.getData<{ status: string }>("health");
-    expect(data.status).toBe("ok");
-    const action = await harness.performAction<{ pong: boolean }>("ping");
-    expect(action.pong).toBe(true);
+    const data = await harness.getData<{ scannedAt: string | null; stalled: unknown[] }>("stalled", { companyId: "co_1" });
+    expect(data).toEqual({ scannedAt: null, stalled: [] });
+  });
+
+  it("scan-now stores and returns stalled issues that the data handler then serves", async () => {
+    const harness = createTestHarness({ manifest });
+    await plugin.definition.setup(harness.ctx);
+    harness.seed({
+      companies: [company("co_1")],
+      issues: [issue("i1", "co_1", 9), issue("i2", "co_1", 20), issue("i3", "co_1", 1)],
+    });
+
+    const result = await harness.performAction<{ scannedAt: string; stalled: { issueId: string }[] }>("scan-now", {
+      companyId: "co_1",
+    });
+    expect(result.stalled.map((row) => row.issueId)).toEqual(["i2", "i1"]);
+
+    const data = await harness.getData<{ stalled: { issueId: string }[] }>("stalled", { companyId: "co_1" });
+    expect(data.stalled.map((row) => row.issueId)).toEqual(["i2", "i1"]);
+  });
+
+  it("scan-now only scans the requested company", async () => {
+    const harness = createTestHarness({ manifest });
+    await plugin.definition.setup(harness.ctx);
+    harness.seed({
+      companies: [company("co_1"), company("co_2")],
+      issues: [issue("i1", "co_1", 9), issue("i2", "co_2", 9)],
+    });
+
+    await harness.performAction("scan-now", { companyId: "co_1" });
+
+    const other = await harness.getData<{ scannedAt: string | null }>("stalled", { companyId: "co_2" });
+    expect(other.scannedAt).toBeNull();
+  });
+
+  it("rejects data and actions without a companyId", async () => {
+    const harness = createTestHarness({ manifest });
+    await plugin.definition.setup(harness.ctx);
+    await expect(harness.getData("stalled", {})).rejects.toThrow("companyId is required");
+    await expect(harness.performAction("scan-now", {})).rejects.toThrow("companyId is required");
   });
 });
