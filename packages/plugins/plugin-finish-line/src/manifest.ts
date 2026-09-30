@@ -9,11 +9,29 @@ const manifest: PaperclipPluginManifestV1 = {
   author: "thermanjr",
   categories: ["automation"],
   capabilities: [
-    "events.subscribe",
+    "jobs.schedule",
+    "companies.read",
+    "issues.read",
     "plugin.state.read",
     "plugin.state.write",
     "ui.dashboardWidget.register"
   ],
+  jobs: [
+    {
+      jobKey: "scan-stalled",
+      displayName: "Scan for stalled issues",
+      description: "Finds open issues with no activity for staleDays and stores them for the dashboard.",
+      schedule: "0 9 * * *"
+    }
+  ],
+  instanceConfigSchema: {
+    type: "object",
+    properties: {
+      staleDays: { type: "number", minimum: 1, default: 5, description: "Days without activity before an issue counts as stalled." },
+      nudgeEnabled: { type: "boolean", default: true, description: "Post one nudge comment per stalled issue." },
+      excludedStatuses: { type: "array", items: { type: "string" }, default: ["done", "cancelled"], description: "Issue statuses to ignore." }
+    }
+  },
   entrypoints: {
     worker: "./dist/worker.js",
     ui: "./dist/ui"

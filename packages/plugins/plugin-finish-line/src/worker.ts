@@ -1,11 +1,11 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
+import { SCAN_JOB_KEY, scanAllCompanies } from "./scan.js";
 
 const plugin = definePlugin({
   async setup(ctx) {
-    ctx.events.on("issue.created", async (event) => {
-      const issueId = event.entityId ?? "unknown";
-      await ctx.state.set({ scopeKind: "issue", scopeId: issueId, stateKey: "seen" }, true);
-      ctx.logger.info("Observed issue.created", { issueId });
+    ctx.jobs.register(SCAN_JOB_KEY, async (job) => {
+      const total = await scanAllCompanies(ctx, new Date());
+      ctx.logger.info("Finish Line scan complete", { runId: job.runId, stalled: total });
     });
 
     ctx.data.register("health", async () => {
