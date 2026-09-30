@@ -2,15 +2,36 @@
   "name": "@thermanjr/plugin-finish-line",
   "version": "0.1.0",
   "type": "module",
-  "private": true,
+  "private": false,
   "description": "Finds stalled issues, shows them on the dashboard, and nudges once per stall.",
+  "homepage": "https://github.com/thermanjr-oss/paperclip/tree/feat/finish-line-plugin/packages/plugins/plugin-finish-line#readme",
+  "bugs": {
+    "url": "https://github.com/thermanjr-oss/paperclip/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thermanjr-oss/paperclip.git",
+    "directory": "packages/plugins/plugin-finish-line"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "node ./esbuild.config.mjs",
     "build:rollup": "rollup -c",
     "dev": "node ./esbuild.config.mjs --watch",
     "dev:ui": "paperclip-plugin-dev-server --root . --ui-dir dist/ui --port 4177",
     "test": "vitest run --config ./vitest.config.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
   },
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
