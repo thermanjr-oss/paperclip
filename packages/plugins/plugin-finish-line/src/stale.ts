@@ -10,7 +10,7 @@ export type FinishLineConfig = {
 export const DEFAULT_CONFIG: FinishLineConfig = {
   staleDays: 5,
   nudgeEnabled: true,
-  excludedStatuses: ["done", "cancelled"],
+  excludedStatuses: ["done", "cancelled", "backlog"],
   maxNudgesPerRun: 20,
 };
 

@@ -47,6 +47,12 @@ describe("evaluateIssue", () => {
     expect(evaluateIssue(issue({ id: "a", status: "cancelled", updatedAt: daysAgo(30) }), NOW, DEFAULT_CONFIG)).toBeNull();
   });
 
+  it("ignores backlog issues by default but flags them when backlog is not excluded", () => {
+    const backlog = issue({ id: "a", status: "backlog", updatedAt: daysAgo(30) });
+    expect(evaluateIssue(backlog, NOW, DEFAULT_CONFIG)).toBeNull();
+    expect(evaluateIssue(backlog, NOW, { ...DEFAULT_CONFIG, excludedStatuses: ["done", "cancelled"] })?.daysStalled).toBe(30);
+  });
+
   it("uses lastActivityAt when it is newer than updatedAt", () => {
     const row = evaluateIssue(issue({ id: "a", updatedAt: daysAgo(20), lastActivityAt: daysAgo(1) }), NOW, DEFAULT_CONFIG);
     expect(row).toBeNull();

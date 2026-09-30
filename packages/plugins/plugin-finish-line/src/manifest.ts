@@ -31,7 +31,7 @@ const manifest: PaperclipPluginManifestV1 = {
       staleDays: { type: "number", minimum: 1, default: 5, description: "Days without activity before an issue counts as stalled." },
       nudgeEnabled: { type: "boolean", default: true, description: "Post one nudge comment per stalled issue." },
       maxNudgesPerRun: { type: "number", minimum: 0, default: 20, description: "Most nudge comments posted per company in one daily run." },
-      excludedStatuses: { type: "array", items: { type: "string" }, default: ["done", "cancelled"], description: "Issue statuses to ignore." }
+      excludedStatuses: { type: "array", items: { type: "string" }, default: ["done", "cancelled", "backlog"], description: "Issue statuses to ignore." }
     }
   },
   entrypoints: {
