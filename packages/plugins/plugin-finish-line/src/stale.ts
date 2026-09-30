@@ -4,12 +4,14 @@ export type FinishLineConfig = {
   staleDays: number;
   nudgeEnabled: boolean;
   excludedStatuses: string[];
+  maxNudgesPerRun: number;
 };
 
 export const DEFAULT_CONFIG: FinishLineConfig = {
   staleDays: 5,
   nudgeEnabled: true,
   excludedStatuses: ["done", "cancelled"],
+  maxNudgesPerRun: 20,
 };
 
 export type StalledIssue = {
@@ -29,7 +31,11 @@ export function resolveConfig(raw: Record<string, unknown> | null | undefined): 
   const excludedStatuses = Array.isArray(raw?.excludedStatuses)
     ? raw.excludedStatuses.filter((s): s is string => typeof s === "string")
     : DEFAULT_CONFIG.excludedStatuses;
-  return { staleDays, nudgeEnabled, excludedStatuses };
+  const maxNudgesPerRun =
+    typeof raw?.maxNudgesPerRun === "number" && raw.maxNudgesPerRun >= 0
+      ? Math.floor(raw.maxNudgesPerRun)
+      : DEFAULT_CONFIG.maxNudgesPerRun;
+  return { staleDays, nudgeEnabled, excludedStatuses, maxNudgesPerRun };
 }
 
 function toTime(value: Date | string | null | undefined): number | null {
@@ -67,4 +73,8 @@ export function findStalled(issues: Issue[], now: Date, config: FinishLineConfig
     .map((issue) => evaluateIssue(issue, now, config))
     .filter((row): row is StalledIssue => row !== null)
     .sort((a, b) => b.daysStalled - a.daysStalled || a.issueId.localeCompare(b.issueId));
+}
+
+export function nudgeBody(daysStalled: number): string {
+  return `No activity on this issue for ${daysStalled} days. Is it blocked, or ready to move?`;
 }

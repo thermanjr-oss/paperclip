@@ -22,12 +22,13 @@ describe("resolveConfig", () => {
   });
 
   it("accepts valid overrides and rejects invalid ones", () => {
-    expect(resolveConfig({ staleDays: 10, nudgeEnabled: false, excludedStatuses: ["backlog"] })).toEqual({
+    expect(resolveConfig({ staleDays: 10, nudgeEnabled: false, excludedStatuses: ["backlog"], maxNudgesPerRun: 3 })).toEqual({
       staleDays: 10,
       nudgeEnabled: false,
       excludedStatuses: ["backlog"],
+      maxNudgesPerRun: 3,
     });
-    expect(resolveConfig({ staleDays: 0, nudgeEnabled: "yes", excludedStatuses: "done" })).toEqual(DEFAULT_CONFIG);
+    expect(resolveConfig({ staleDays: 0, nudgeEnabled: "yes", excludedStatuses: "done", maxNudgesPerRun: -1 })).toEqual(DEFAULT_CONFIG);
   });
 });
 
