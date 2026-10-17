@@ -199,3 +199,7 @@ PR #2218 (`feat/external-adapter-phase1`) adds external adapter support. See roo
 - `createServerAdapter()` must include ALL optional fields (especially `detectModel`)
 - Built-in UI adapters can shadow external plugin parsers — remove built-in when fully externalizing
 - Reference external adapters: Hermes (`@henkey/hermes-paperclip-adapter` or `file:`) and Droid (npm)
+
+## App improvement workflow
+
+For work on activation, retention, conversion, or user-journey friction, use the repository's [Improve Apps with Data skill](.agents/skills/improve-apps-with-data/SKILL.md) and read its [application profile](.agents/skills/improve-apps-with-data/references/application.md). Define one outcome, inspect available evidence, prepare a small reversible change, and record checks and uncertainty. Preserve this repository's security, privacy, hosting, and release rules. Adding this guidance does not mean runtime analytics, recording, or experiments are enabled.
