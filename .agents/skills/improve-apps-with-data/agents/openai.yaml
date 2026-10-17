@@ -1,0 +1,4 @@
+interface:
+  display_name: "Improve Apps with Data"
+  short_description: "Use telemetry and experiments to improve apps"
+  default_prompt: "Use $improve-apps-with-data to assess one measurable improvement in this application using its local profile."
